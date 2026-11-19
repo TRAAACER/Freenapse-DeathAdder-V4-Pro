@@ -2,7 +2,7 @@
 
 在原版 [freenapse](https://github.com/MatthewSaintBull/freenapse) `0.5.2` 的基础上，增加适配**炼狱蝰蛇 V4 PRO（Razer DeathAdder V4 Pro）**，并作出些许优化，由 **Gemini 4 Carbon** 和 **ChatGPT 6 Astra PRO** 共同完成修改。
 
-后续没啥恶性 Bug 的话，不打算常规更新。
+后续没啥恶性 Bug 的话，不打算更新，单纯分享使用，省一省大家的token。
 
 ## 相比原版 0.5.2 的新增与优化
 
