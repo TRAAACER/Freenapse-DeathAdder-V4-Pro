@@ -106,8 +106,78 @@ fn mouse_input(flags: u32, data: i32, dx: i32, dy: i32) -> INPUT {
     INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: INJECT_MARK } } }
 }
 
-/// Play the events once. Delays are interruptible through `stop`.
+fn mouse_up_flags(button: u8) -> Option<(u32, i32)> {
+    Some(match button {
+        1 => (MOUSEEVENTF_LEFTUP, 0),
+        2 => (MOUSEEVENTF_RIGHTUP, 0),
+        3 => (MOUSEEVENTF_MIDDLEUP, 0),
+        4 => (MOUSEEVENTF_XUP, 1),
+        5 => (MOUSEEVENTF_XUP, 2),
+        _ => return None,
+    })
+}
+
+/// Tracks keys and mouse buttons pressed down during one macro run so early
+/// cancellation (key release, game profile switch, config reload) never leaves
+/// a logical key or mouse button stuck down.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct HeldState {
+    keys: Vec<u16>,
+    buttons: u8,
+}
+
+impl HeldState {
+    pub fn note_key(&mut self, vk: u16, up: bool) {
+        if up {
+            if let Some(p) = self.keys.iter().rposition(|k| *k == vk) {
+                self.keys.remove(p);
+            }
+        } else if !self.keys.contains(&vk) {
+            self.keys.push(vk);
+        }
+    }
+
+    pub fn note_button(&mut self, b: u8, up: bool) {
+        if (1..=5).contains(&b) {
+            let bit = 1u8 << (b - 1);
+            if up {
+                self.buttons &= !bit;
+            } else {
+                self.buttons |= bit;
+            }
+        }
+    }
+
+    /// Drain remaining held buttons (`1..=5`) and virtual keys (reverse press order).
+    pub fn drain_releases(&mut self) -> (Vec<u8>, Vec<u16>) {
+        let mut btns = Vec::new();
+        for b in (1..=5u8).rev() {
+            let bit = 1u8 << (b - 1);
+            if self.buttons & bit != 0 {
+                btns.push(b);
+            }
+        }
+        self.buttons = 0;
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.reverse();
+        (btns, keys)
+    }
+}
+
+/// True when a repeating `Held` / `Toggle` loop has no >=10 ms delay of its own and must yield.
+pub fn loop_needs_yield(events: &[Event]) -> bool {
+    !events.iter().any(|e| matches!(e, Event::Delay(ms) if *ms >= 10))
+}
+
+/// True when the macro launches a program/URL and must never repeat in a tight loop.
+pub fn has_launch(events: &[Event]) -> bool {
+    events.iter().any(|e| matches!(e, Event::Launch(_)))
+}
+
+/// Play the events once. Delays are interruptible through `stop`, and any keys or
+/// mouse buttons left pressed when cancelled are released before returning.
 pub fn play(events: &[Event], stop: &AtomicBool) {
+    let mut held = HeldState::default();
     for e in events {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -116,7 +186,9 @@ pub fn play(events: &[Event], stop: &AtomicBool) {
             match e {
                 Event::KeyDown(u) | Event::KeyUp(u) => {
                     if let Some(vk) = usage_vk(*u) {
-                        send(key_input(vk, matches!(e, Event::KeyUp(_))));
+                        let up = matches!(e, Event::KeyUp(_));
+                        send(key_input(vk, up));
+                        held.note_key(vk, up);
                     }
                 }
                 Event::ButtonDown(b) | Event::ButtonUp(b) => {
@@ -130,6 +202,7 @@ pub fn play(events: &[Event], stop: &AtomicBool) {
                         _ => continue,
                     };
                     send(mouse_input(flags, data, 0, 0));
+                    held.note_button(*b, up);
                 }
                 Event::Scroll(d) => send(mouse_input(MOUSEEVENTF_WHEEL, if *d > 0 { 120 } else { -120 }, 0, 0)),
                 Event::Cursor(x, y) => send(mouse_input(MOUSEEVENTF_MOVE, 0, *x as i32, *y as i32)),
@@ -153,6 +226,17 @@ pub fn play(events: &[Event], stop: &AtomicBool) {
                 }
                 Event::Launch(target) => launch(target),
             }
+        }
+    }
+    let (btns, keys) = held.drain_releases();
+    unsafe {
+        for b in btns {
+            if let Some((flags, data)) = mouse_up_flags(b) {
+                send(mouse_input(flags, data, 0, 0));
+            }
+        }
+        for vk in keys {
+            send(key_input(vk, true));
         }
     }
 }
@@ -223,5 +307,24 @@ mod tests {
         let s = sequence_steps(&ev);
         assert_eq!(s.len(), 2);
         assert_eq!(s[1], vec![Event::KeyDown(5), Event::KeyUp(5)]);
+    }
+
+    #[test]
+    fn held_state_releases_keys_and_buttons_on_cancel() {
+        let mut h = HeldState::default();
+        h.note_key(0xa2, false); // L-Ctrl down
+        h.note_key(0x57, false); // W down
+        h.note_button(1, false); // Left mouse down
+        h.note_button(2, false); // Right mouse down
+        h.note_button(2, true); // Right mouse already released normally
+        let (btns, keys) = h.drain_releases();
+        assert_eq!(btns, vec![1]);
+        assert_eq!(keys, vec![0x57, 0xa2], "released in reverse press order");
+        assert_eq!(h.drain_releases(), (vec![], vec![]));
+
+        assert!(loop_needs_yield(&[]));
+        assert!(loop_needs_yield(&[Event::KeyDown(4), Event::KeyUp(4)]));
+        assert!(!loop_needs_yield(&[Event::KeyDown(4), Event::Delay(20), Event::KeyUp(4)]));
+        assert!(has_launch(&[Event::Launch("notepad.exe".into())]));
     }
 }

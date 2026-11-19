@@ -2,7 +2,7 @@
 //! when it differs, so repeated runs do not wear the onboard flash.
 
 use crate::config::{Config, button_target, parse_button, spec_for};
-use crate::device::{ButtonFunction, Mouse};
+use crate::device::{ButtonFunction, DongleKind, Mouse, dongle_led_slot_name_checked};
 use crate::hid::{HidError, Result};
 use crate::protocol::Status;
 use crate::sensor;
@@ -64,19 +64,41 @@ pub fn import(mouse: &Mouse) -> Result<Config> {
     if let Some(s) = s {
         if s.mode == sensor::LIFT_MODE_SMART && !s.use_calibration {
             sc.tracking = "smart".into();
+            sc.asymmetric = false;
             sc.lift = (s.height + 1).clamp(1, 3);
+        } else if s.mode == sensor::LIFT_MODE_ASYMMETRIC
+            && s.use_calibration
+            && let Some((lift, land)) = s.asym_levels
+        {
+            sc.tracking = "smart".into();
+            sc.asymmetric = true;
+            sc.lift = lift;
+            sc.land = land;
         }
     }
     if let Ok((on, deg)) = mouse.rotation() {
         sc.rotation = if on { deg.clamp(-30, 30) } else { 0 };
     }
 
-    if mouse.spec().pairing {
-        if let Ok(led) = mouse.dongle_led_mode() {
-            if (1..=3).contains(&led) {
-                cfg.dongle.led = led;
+    match mouse.spec().dongle {
+        DongleKind::HyperPolling => {
+            if let Ok(led) = mouse.dongle_led_mode() {
+                if (1..=3).contains(&led) {
+                    cfg.dongle.led = led;
+                }
             }
         }
+        DongleKind::Gen2Dome => {
+            let leds = mouse.dongle_leds()?;
+            let mut names = Vec::with_capacity(3);
+            for c in leds {
+                let n = dongle_led_slot_name_checked(c).ok_or_else(|| HidError::Invalid(format!("unknown dongle LED slot code 0x{c:02x}")))?;
+                names.push(n.to_string());
+            }
+            cfg.dongle.leds = names;
+            cfg.dongle.brightness = Some(mouse.dongle_led_brightness()?);
+        }
+        DongleKind::None => {}
     }
 
     for (zone, _) in mouse.spec().lighting {
@@ -183,7 +205,7 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
         }
     }
 
-    if mouse.polling_rate().ok() != Some(polling_rate) {
+    if mouse.polling_rate()? != polling_rate {
         mouse.set_polling_rate(polling_rate)?;
         changes.push(format!("polling -> {polling_rate} Hz"));
     }
@@ -202,11 +224,7 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
     // The tracking page is only written where it is known to apply (src/sensor.rs).
     if let Some(tracking) = tracking.filter(|_| spec.sensor_tracking) {
         let plan = tracking.plan().map_err(|_| HidError::Unsupported("invalid [sensor] section"))?;
-        let cur = mouse.sensor()?;
-        // The asymmetric levels cannot be read back, so that mode is always rewritten.
-        let differs = cur.use_calibration != plan.state || (cur.mode, cur.height) != plan.lift || plan.config.is_some();
-        if differs {
-            mouse.apply_tracking(&plan)?;
+        if mouse.sync_tracking(&plan)? {
             changes.push(format!("tracking -> {tracking:?}"));
         }
     }
@@ -233,9 +251,26 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
         }
     }
 
-    if spec.pairing && mouse.dongle_led_mode().ok() != Some(cfg.dongle.led) {
-        mouse.set_dongle_led_mode(cfg.dongle.led)?;
-        changes.push(format!("dongle led -> {}", cfg.dongle.led));
+    match spec.dongle {
+        DongleKind::HyperPolling => {
+            if mouse.dongle_led_mode()? != cfg.dongle.led {
+                mouse.set_dongle_led_mode(cfg.dongle.led)?;
+                changes.push(format!("dongle led -> {}", cfg.dongle.led));
+            }
+        }
+        DongleKind::Gen2Dome => {
+            if let Some(want_leds) = cfg.dongle.led_codes().map_err(HidError::Invalid)? {
+                if mouse.sync_dongle_leds(want_leds)? {
+                    changes.push(format!("dongle leds -> {:?}", cfg.dongle.leds));
+                }
+            }
+            if let Some(want_br) = cfg.dongle.brightness {
+                if mouse.sync_dongle_led_brightness(want_br)? {
+                    changes.push(format!("dongle led brightness -> {}%", want_br * 25));
+                }
+            }
+        }
+        DongleKind::None => {}
     }
 
     changes.extend(apply_lighting(mouse, cfg)?);
@@ -305,7 +340,7 @@ pub fn apply_macros(mouse: &Mouse, cfg: &Config) -> Result<Vec<String>> {
             continue; // text / launch steps: played by the tray app, nothing to store
         }
         let bytes = m.bytes();
-        let same = stored.contains(&m.id) && mouse.macro_data(m.id).map(|d| d == bytes).unwrap_or(false);
+        let same = stored.contains(&m.id) && mouse.macro_data(m.id)? == bytes;
         if !same {
             mouse.write_macro(m.id, &m.name, &bytes)?;
             changes.push(format!("macro {} ({}) -> {} bytes", m.id, m.name, bytes.len()));

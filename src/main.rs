@@ -14,7 +14,7 @@ use freenapse::sensor::Tracking;
 use freenapse::{apply, config_path};
 
 const USAGE: &str = "\
-freenapse - lightweight Razer mouse control (replaces Razer Synapse)
+Freenapse-DeathAdder V4 Pro - lightweight Razer DeathAdder V4 Pro onboard control
 
 Writes to the mice an owner has verified, reads any other Razer mouse: `freenapse status` names
 the one that is connected, the Devices page of the settings window lists them all.
@@ -22,7 +22,7 @@ the one that is connected, the Devices page of the settings window lists them al
 The wireless mouse only answers while it is awake: keep moving it while running commands.
 
 USAGE:
-  freenapse status                       battery, DPI, polling, sleep, sensor, dongle
+  freenapse status [--serials]           battery, DPI, polling, sleep, sensor, dongle (serials masked unless --serials)
   freenapse probe [--serials]            what the mouse answers, raw, to paste into an issue for a new mouse (serial numbers masked unless --serials)
   freenapse apply                        write the config file to the mouse (onboard memory)
   freenapse config                       print the config file path (created from the mouse if missing)
@@ -39,7 +39,7 @@ USAGE:
                                          breathing:#rrggbb, breathing:random (zones: logo, wheel)
   freenapse lighting brightness <0..100> brightness of every zone
   freenapse dynamic off|classic|natural|jump|custom   Dynamic Sensitivity (custom uses the config's curve)
-  freenapse dongle-led <1|2|3>           HyperPolling dongle LED: battery | polling rate | off
+  freenapse dongle-led [args..]          dongle LED: <1|2|3> on HyperPolling; <left> <center> <right> or brightness <0..4> on Gen-2 dome dongle
   freenapse buttons [profile]            show the onboard button mapping (default profile 1)
   freenapse profiles                     onboard profiles: how many exist, how many the mouse can hold
   freenapse profile <1..5>               select the onboard profile (created if the mouse has room)
@@ -85,10 +85,15 @@ fn main() -> ExitCode {
         freenapse::tray::run(args.iter().any(|a| a == "--settings"));
         return ExitCode::SUCCESS;
     }
-    // CLI mode: this is a windowed executable, so attach to the console we were started from.
+    // CLI mode: this is a windowed executable, so attach to the console we were
+    // started from unless stdout/stderr was already redirected to a file or pipe.
     unsafe {
-        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-        AttachConsole(ATTACH_PARENT_PROCESS);
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE};
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if out == 0 || out == INVALID_HANDLE_VALUE {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
     let Some(cmd) = args.first() else {
         eprint!("{USAGE}");
@@ -152,11 +157,11 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         "help" | "-h" | "--help" => {
-            print!("{}", USAGE.replacen("freenapse -", &format!("freenapse {} -", freenapse::VERSION), 1));
+            print!("{}", USAGE.replacen("Freenapse-DeathAdder V4 Pro -", &format!("Freenapse-DeathAdder V4 Pro ({}) -", freenapse::VERSION), 1));
             return Ok(());
         }
         "version" | "-V" | "--version" => {
-            println!("freenapse {}", freenapse::VERSION);
+            println!("Freenapse-DeathAdder V4 Pro ({})", freenapse::VERSION);
             return Ok(());
         }
         _ => {}
@@ -164,7 +169,7 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mouse = Mouse::open()?;
     match cmd {
-        "status" => status(&mouse)?,
+        "status" => status(&mouse, args.iter().any(|a| a == "--serials"))?,
         "import" => {
             let mut cfg = apply::import(&mouse)?;
             let p = config_path();
@@ -356,11 +361,43 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let (on, mode) = mouse.acceleration()?;
             println!("dynamic sensitivity: {}", if on { mode.name() } else { "off" });
         }
-        "dongle-led" => {
-            let m: u8 = arg(args, 0, "mode")?;
-            mouse.set_dongle_led_mode(m)?;
-            println!("dongle led mode {}", mouse.dongle_led_mode()?);
-        }
+        "dongle-led" => match mouse.spec().dongle {
+            freenapse::device::DongleKind::Gen2Dome => {
+                if args.first().map(String::as_str) == Some("brightness") {
+                    let lv: u8 = arg(args, 1, "brightness 0..4")?;
+                    if lv > 4 {
+                        return Err("brightness must be 0..4".into());
+                    }
+                    mouse.set_dongle_led_brightness(lv)?;
+                } else if !args.is_empty() {
+                    if args.len() != 3 {
+                        return Err("dongle-led [<left> <center> <right> | brightness <0..4>] (slots: battery, connection, polling, dpi, off)".into());
+                    }
+                    let mut leds = [0u8; 3];
+                    for (i, s) in args.iter().enumerate() {
+                        leds[i] = freenapse::device::dongle_led_slot_code(s)
+                            .ok_or_else(|| format!("bad dongle LED '{s}': use battery, connection, polling, dpi or off"))?;
+                    }
+                    mouse.set_dongle_leds(leds)?;
+                }
+                let leds = mouse.dongle_leds()?;
+                let br = mouse.dongle_led_brightness()?;
+                println!(
+                    "dongle leds: left={}, center={}, right={}, brightness={}% (level {br})",
+                    freenapse::device::dongle_led_slot_name(leds[0]),
+                    freenapse::device::dongle_led_slot_name(leds[1]),
+                    freenapse::device::dongle_led_slot_name(leds[2]),
+                    br.min(4) * 25,
+                );
+            }
+            _ => {
+                if let Some(first) = args.first() {
+                    let m: u8 = first.parse().map_err(|e| format!("bad mode '{first}': {e}"))?;
+                    mouse.set_dongle_led_mode(m)?;
+                }
+                println!("dongle led mode {}", mouse.dongle_led_mode()?);
+            }
+        },
         "buttons" => {
             let profile: u8 = args.first().map(|s| s.parse()).transpose()?.unwrap_or(1);
             for b in mouse.spec().buttons {
@@ -382,6 +419,9 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let bytes: Vec<u8> = args.iter().map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16)).collect::<Result<_, _>>()?;
             if bytes.len() < 3 {
                 return Err("raw [-d] <class> <id> <size> [args..]".into());
+            }
+            if bytes.len() - 3 > 80 {
+                return Err("raw accepts at most 80 argument bytes".into());
             }
             let req = Report::new(tid, bytes[0], bytes[1], bytes[2]).with_args(&bytes[3..]);
             let r = mouse.raw(&req)?;
@@ -431,7 +471,8 @@ where
     s.parse().map_err(|e| format!("bad {what} '{s}': {e}"))
 }
 
-fn status(mouse: &Mouse) -> Result<(), Box<dyn std::error::Error>> {
+fn status(mouse: &Mouse, show_serials: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let fmt_serial = |s: String| if show_serials { s } else { freenapse::probe::mask_serial_text(&s) };
     let spec = mouse.spec();
     let trust = match (spec.verified, mouse.writes_allowed()) {
         (true, _) => "",
@@ -443,10 +484,10 @@ fn status(mouse: &Mouse) -> Result<(), Box<dyn std::error::Error>> {
     if mouse.is_wireless()
         && let Ok((a, b)) = mouse.dongle_firmware()
     {
-        println!("dongle:       fw {a}.{b}  serial {}", mouse.dongle_serial().unwrap_or_default());
+        println!("dongle:       fw {a}.{b}  serial {}", fmt_serial(mouse.dongle_serial().unwrap_or_default()));
     }
     match mouse.firmware() {
-        Ok((a, b)) => println!("mouse:        fw {a}.{b}  serial {}", mouse.serial().unwrap_or_default()),
+        Ok((a, b)) => println!("mouse:        fw {a}.{b}  serial {}", fmt_serial(mouse.serial().unwrap_or_default())),
         Err(e) => {
             println!("mouse:        {e}");
             return Ok(());
@@ -492,8 +533,26 @@ fn status(mouse: &Mouse) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok((n, max)) = mouse.profiles() {
         println!("profiles:     {n} onboard (the mouse supports {max}), using profile {}", mouse.profile());
     }
-    if spec.pairing {
-        println!("dongle led:   {}", mouse.dongle_led_mode().map(|p| p.to_string()).unwrap_or_else(|e| e.to_string()));
+    match spec.dongle {
+        freenapse::device::DongleKind::HyperPolling => {
+            println!("dongle led:   {}", mouse.dongle_led_mode().map(|p| p.to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        freenapse::device::DongleKind::Gen2Dome => {
+            let leds = mouse
+                .dongle_leds()
+                .map(|l| {
+                    format!(
+                        "left={}, center={}, right={}",
+                        freenapse::device::dongle_led_slot_name(l[0]),
+                        freenapse::device::dongle_led_slot_name(l[1]),
+                        freenapse::device::dongle_led_slot_name(l[2]),
+                    )
+                })
+                .unwrap_or_else(|e| e.to_string());
+            let br = mouse.dongle_led_brightness().map(|b| format!(", brightness {}%", b.min(4) * 25)).unwrap_or_default();
+            println!("dongle leds:  {leds}{br}");
+        }
+        freenapse::device::DongleKind::None => {}
     }
     Ok(())
 }

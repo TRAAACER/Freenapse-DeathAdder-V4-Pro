@@ -61,7 +61,7 @@ pub fn install_panic_hook(gui: bool) {
         if gui {
             let where_ = if written { format!("Details were written to\n{}", path.display()) } else { "The crash report could not be written.".to_string() };
             let text = format!(
-                "freenapse {} stopped because of an internal error:\n\n{message}\n\n{where_}\n\nPlease paste that file into an issue at\nhttps://github.com/MatthewSaintBull/freenapse/issues",
+                "freenapse {} stopped because of an internal error:\n\n{message}\n\n{where_}\n\nPlease paste that file into an issue at\nhttps://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro/issues",
                 crate::VERSION
             );
             message_box("freenapse stopped", &text);

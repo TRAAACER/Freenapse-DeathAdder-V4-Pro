@@ -228,8 +228,24 @@ pub fn run_with(mouse: &Mouse, show_serials: bool, emit: &mut dyn FnMut(String))
     p.read("device mode", cmd::get_device_mode(), &|r| Some(format!("mode {} ({})", r.arguments[0], if r.arguments[0] == 3 { "driver" } else { "normal" })));
     p.blank();
 
-    p.read("dongle firmware", cmd::firmware_version(TID_DONGLE), &|r| Some(format!("firmware {}.{}", r.arguments[0], r.arguments[1])));
-    p.read_masked("dongle serial", cmd::serial(TID_DONGLE), &|r| Some(ascii(&r.arguments[..22])), !show_serials);
+    if p.read("dongle firmware", cmd::firmware_version(TID_DONGLE), &|r| Some(format!("firmware {}.{}", r.arguments[0], r.arguments[1]))).is_none() {
+        p.read("dongle gen2 firmware", cmd::dongle_gen2_firmware(), &|r| Some(format!("firmware {}.{}", r.arguments[0], r.arguments[1])));
+        p.read_masked("dongle gen2 serial", cmd::dongle_gen2_serial(), &|r| Some(ascii(&r.arguments[..22])), !show_serials);
+        p.read("dongle gen2 leds", cmd::get_dongle_leds(), &|r| {
+            Some(format!(
+                "left={} ({:02x}) center={} ({:02x}) right={} ({:02x})",
+                crate::device::dongle_led_slot_name(r.arguments[0]),
+                r.arguments[0],
+                crate::device::dongle_led_slot_name(r.arguments[1]),
+                r.arguments[1],
+                crate::device::dongle_led_slot_name(r.arguments[2]),
+                r.arguments[2],
+            ))
+        });
+        p.read("dongle gen2 led br", cmd::get_dongle_led_brightness(), &|r| Some(format!("level {} ({}%)", r.arguments[0], r.arguments[0].min(4) * 25)));
+    } else {
+        p.read_masked("dongle serial", cmd::serial(TID_DONGLE), &|r| Some(ascii(&r.arguments[..22])), !show_serials);
+    }
     p.read("dongle paired list", cmd::get_paired_devices(TID_DONGLE), &|r| {
         let n = (r.arguments[0] as usize).min(8);
         let items: Vec<String> =
@@ -329,6 +345,14 @@ pub fn mask_serial(r: &Report) -> Report {
     m
 }
 
+/// Mask a decoded serial string after its first four characters (`"PM24..."` -> `"PM24***********"`).
+pub fn mask_serial_text(s: &str) -> String {
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(4).collect();
+    let rest_len = chars.count();
+    if rest_len == 0 { prefix } else { format!("{prefix}{}", "*".repeat(rest_len)) }
+}
+
 fn ascii(bytes: &[u8]) -> String {
     let s: String = bytes.iter().take_while(|b| **b != 0).map(|b| if b.is_ascii_graphic() { *b as char } else { '?' }).collect();
     if s.is_empty() { "(empty)".into() } else { s }
@@ -382,6 +406,8 @@ mod tests {
         r.arguments[..15].copy_from_slice(b"PM2431H32400480");
         let m = mask_serial(&r);
         assert_eq!(ascii(&m.arguments[..22]), "PM24***********");
+        assert_eq!(mask_serial_text("PM2431H32400480"), "PM24***********");
+        assert_eq!(mask_serial_text("PM24"), "PM24");
         assert_eq!(hex(&m.arguments, 6), "50 4d 32 34 2a 2a");
         assert_eq!(m.arguments[15], 0, "padding stays zero");
         assert_eq!(ascii(&r.arguments[..22]), "PM2431H32400480", "the original is untouched");

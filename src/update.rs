@@ -10,10 +10,10 @@ use std::ptr;
 use windows_sys::Win32::Networking::WinHttp::*;
 
 /// Where the menu item takes the user.
-pub const RELEASES_URL: &str = "https://github.com/MatthewSaintBull/freenapse/releases/latest";
+pub const RELEASES_URL: &str = "https://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro/releases/latest";
 
 const API_HOST: &str = "api.github.com";
-const API_PATH: &str = "/repos/MatthewSaintBull/freenapse/releases/latest";
+const API_PATH: &str = "/repos/TRAAACER/Freenapse-DeathAdder-V4-Pro/releases/latest";
 
 /// `major.minor.patch` of a version or a `v`-prefixed tag; anything after the
 /// patch number (a pre-release suffix) is ignored.

@@ -69,7 +69,8 @@ impl Report {
     }
 
     pub fn with_args(mut self, args: &[u8]) -> Report {
-        self.arguments[..args.len()].copy_from_slice(args);
+        let n = args.len().min(self.arguments.len());
+        self.arguments[..n].copy_from_slice(&args[..n]);
         self
     }
 
@@ -239,6 +240,32 @@ pub mod cmd {
         Report::new(TID_DONGLE, 0x07, 0x90, 0x01)
     }
 
+    /// HyperSpeed Wireless Gen-2 dome dongle (DeathAdder V4 Pro 0x00BF):
+    /// firmware and serial use 0x00/0x91 and 0x00/0x92 on transaction id 0xff.
+    pub fn dongle_gen2_firmware() -> Report {
+        Report::new(TID_DONGLE, 0x00, 0x91, 0x02)
+    }
+    pub fn dongle_gen2_serial() -> Report {
+        Report::new(TID_DONGLE, 0x00, 0x92, 0x16)
+    }
+
+    /// HyperSpeed Gen-2 dome dongle 3-LED indicator slots (left, center, right):
+    /// 0 = off, 1 = connection, 2 = battery, 3 = polling rate, 4 = DPI stage.
+    pub fn set_dongle_leds(leds: [u8; 3]) -> Report {
+        Report::new(TID_DONGLE, 0x07, 0x15, 0x03).with_args(&[leds[0].min(4), leds[1].min(4), leds[2].min(4)])
+    }
+    pub fn get_dongle_leds() -> Report {
+        Report::new(TID_DONGLE, 0x07, 0x95, 0x03)
+    }
+
+    /// HyperSpeed Gen-2 dome dongle indicator brightness level (0..=4).
+    pub fn set_dongle_led_brightness(level: u8) -> Report {
+        Report::new(TID_DONGLE, 0x07, 0x16, 0x01).with_args(&[level.min(4)])
+    }
+    pub fn get_dongle_led_brightness() -> Report {
+        Report::new(TID_DONGLE, 0x07, 0x96, 0x01)
+    }
+
     // --- Button mapping (class 0x02), onboard profiles ---
 
     /// `profile` 0 = direct/volatile, 1..=5 onboard; `hypershift` layer flag.
@@ -401,5 +428,20 @@ mod tests {
         assert_eq!(cmd::byte_to_percent(255), 100);
         assert_eq!(cmd::byte_to_percent(0x3f), 25);
         assert_eq!(cmd::byte_to_percent(0x0c), 5);
+    }
+
+    #[test]
+    fn gen2_dongle_commands() {
+        let fw = cmd::dongle_gen2_firmware();
+        assert_eq!((fw.transaction_id, fw.command_class, fw.command_id, fw.data_size), (TID_DONGLE, 0x00, 0x91, 0x02));
+        let ser = cmd::dongle_gen2_serial();
+        assert_eq!((ser.transaction_id, ser.command_class, ser.command_id, ser.data_size), (TID_DONGLE, 0x00, 0x92, 0x16));
+        let set_leds = cmd::set_dongle_leds([2, 1, 3]);
+        assert_eq!((set_leds.transaction_id, set_leds.command_class, set_leds.command_id, set_leds.data_size), (TID_DONGLE, 0x07, 0x15, 0x03));
+        assert_eq!(&set_leds.arguments[..3], &[2, 1, 3]);
+        let get_leds = cmd::get_dongle_leds();
+        assert_eq!((get_leds.transaction_id, get_leds.command_class, get_leds.command_id, get_leds.data_size), (TID_DONGLE, 0x07, 0x95, 0x03));
+        let br = cmd::set_dongle_led_brightness(9);
+        assert_eq!((br.command_class, br.command_id, br.arguments[0]), (0x07, 0x16, 4));
     }
 }

@@ -34,7 +34,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::accel;
 use crate::config::{Config, GameConfig, MacroConfig, macro_spec, parse_button};
-use crate::device::{Battery, DeviceSpec, DpiStages, MacroStorage, Mouse, PairedDevice, PhysicalButton};
+use crate::device::{Battery, DONGLE_LED_SLOTS, DeviceSpec, DongleKind, DpiStages, MacroStorage, Mouse, PairedDevice, PhysicalButton};
 use crate::hid::HidError;
 use crate::library::{self, Game};
 use crate::macros::{self, Playback};
@@ -159,42 +159,42 @@ impl Page {
 
     pub fn title(self) -> &'static str {
         match self {
-            Page::Customize => "CUSTOMIZE",
-            Page::Performance => "PERFORMANCE",
-            Page::Calibration => "CALIBRATION",
-            Page::Power => "POWER",
-            Page::Games => "GAMES",
-            Page::Devices => "DEVICES",
-            Page::Roadmap => "ROADMAP",
-            Page::App => "SETTINGS",
+            Page::Customize => "按键自定义",
+            Page::Performance => "性能",
+            Page::Calibration => "传感器校准",
+            Page::Power => "电源与接收器",
+            Page::Games => "游戏配置",
+            Page::Devices => "支持设备",
+            Page::Roadmap => "功能总览",
+            Page::App => "软件设置",
         }
     }
 
     /// Sidebar and title bar name.
     pub fn label(self) -> &'static str {
         match self {
-            Page::Customize => "Customize",
-            Page::Performance => "Performance",
-            Page::Calibration => "Calibration",
-            Page::Power => "Power",
-            Page::Games => "Games",
-            Page::Devices => "Devices",
-            Page::Roadmap => "Roadmap",
-            Page::App => "Settings",
+            Page::Customize => "按键自定义",
+            Page::Performance => "性能",
+            Page::Calibration => "传感器校准",
+            Page::Power => "电源与接收器",
+            Page::Games => "游戏配置",
+            Page::Devices => "支持设备",
+            Page::Roadmap => "功能总览",
+            Page::App => "软件设置",
         }
     }
 
     /// One line under the title.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Page::Customize => "Button assignments, Hypershift and macros, stored in the mouse",
-            Page::Performance => "Sensitivity, Dynamic Sensitivity, polling rate and rotation",
-            Page::Calibration => "Lift-off and landing on your surface",
-            Page::Power => "Battery, sleep and the HyperPolling dongle",
-            Page::Games => "Profiles that switch on while a game is in the foreground",
-            Page::Devices => "The Razer mice freenapse knows, and how far each one goes",
-            Page::Roadmap => "What freenapse does compared with Razer Synapse 4",
-            Page::App => "Tray app, onboard profile, dongle pairing and device info",
+            Page::Customize => "8 键改键、Hypershift 第二层与宏录制，直写鼠标板载内存",
+            Page::Performance => "45K DPI 档位、动态灵敏度曲线、8000 Hz 回报率与传感器角度微调",
+            Page::Calibration => "Focus Pro 45K 智能追踪与非对称抬起 / 着陆截断高度",
+            Page::Power => "电池电量、休眠节能与无线接收器指示灯设置",
+            Page::Games => "游戏前台运行时自动切换专属 DPI 档位、回报率与按键布局",
+            Page::Devices => "已适配的雷蛇鼠标型号及板载读写验证状态",
+            Page::Roadmap => "Freenapse-DeathAdder V4 Pro 与 Razer Synapse 4 功能对照一览",
+            Page::App => "托盘自启、板载配置文件、固件序列号与诊断工具",
         }
     }
 
@@ -252,8 +252,11 @@ pub enum Id {
     Idle,
     LowBattery,
     DongleLed,
+    DongleLedSlot(usize),
+    DongleLedBright,
     NotifyPercent,
     PollSeconds,
+    OnboardOnly,
     Autostart,
     OpenConfig,
     Reimport,
@@ -350,11 +353,11 @@ pub enum Kind {
     Toggle {
         on: bool,
     },
-    /// Segmented control. `xs` are the option spans relative to `rect.left`.
+    /// Segmented / wrapped chips. `rects` are option boxes relative to `(rect.left, rect.top)`.
     Chips {
         options: Vec<String>,
         selected: Option<usize>,
-        xs: Vec<(i32, i32)>,
+        rects: Vec<RECT>,
     },
     Slider {
         min: i32,
@@ -484,6 +487,8 @@ enum Write {
     Tracking,
     Rotation,
     DongleLed,
+    DongleLeds,
+    DongleBright,
     Accel,
     Profile,
     Lighting,
@@ -526,6 +531,8 @@ pub struct Ui {
     pub(crate) battery: Option<Battery>,
     pub(crate) fw: Option<(u8, u8)>,
     pub(crate) dongle_fw: Option<(u8, u8)>,
+    pub(crate) dongle_leds: Option<[u8; 3]>,
+    pub(crate) dongle_bright: Option<u8>,
     pub(crate) serial: Option<String>,
     pub(crate) wireless: bool,
     /// What the device table says about the open mouse (`DeviceSpec::any_mouse` until one is open).
@@ -596,6 +603,29 @@ pub struct Ui {
     pub(crate) pairing_since: Option<Instant>,
     /// "Unpair" was clicked once; the next click does it.
     pub(crate) confirm_unpair: bool,
+}
+
+/// Friendly Chinese model name for the UI sidebar and device table.
+pub(crate) fn display_model(raw: &str) -> String {
+    let base = raw.trim_start_matches("Razer ").split(" (").next().unwrap_or(raw);
+    match base {
+        "DeathAdder V4 Pro" => "炼狱蝰蛇 V4 Pro".into(),
+        "DeathAdder V3 Pro" => "炼狱蝰蛇 V3 Pro".into(),
+        "DeathAdder V3" => "炼狱蝰蛇 V3".into(),
+        "Viper V3 Pro" => "毒蝰 V3 Pro".into(),
+        "Viper V3 Pro SE" => "毒蝰 V3 Pro SE".into(),
+        "Viper V2 Pro" => "毒蝰 V2 Pro".into(),
+        "Viper V3 HyperSpeed" => "毒蝰 V3 极速版".into(),
+        "Viper Mini SE" => "毒蝰 Mini SE".into(),
+        "Viper 8KHz" => "毒蝰 8KHz".into(),
+        "Cobra Pro" => "眼镜蛇专业版".into(),
+        "Basilisk V2" => "巴塞利斯蛇 V2".into(),
+        "Basilisk V3" => "巴塞利斯蛇 V3".into(),
+        "Basilisk V3 Pro" => "巴塞利斯蛇 V3 专业版".into(),
+        "Pro Click V2 Vertical" => "Pro Click V2 垂直版".into(),
+        "HyperPolling wireless dongle" => "HyperPolling 无线接收器".into(),
+        other => other.into(),
+    }
 }
 
 /// Brand-like dot colour for a launcher badge.
@@ -701,6 +731,8 @@ unsafe fn create(owner: HWND) -> HWND {
         battery: None,
         fw: None,
         dongle_fw: None,
+        dongle_leds: None,
+        dongle_bright: None,
         serial: None,
         wireless: true,
         spec: DeviceSpec::default(),
@@ -751,7 +783,7 @@ unsafe fn create(owner: HWND) -> HWND {
     let hwnd = CreateWindowExW(
         0,
         class.as_ptr(),
-        wide("freenapse").as_ptr(),
+        wide("Freenapse-DeathAdder V4 Pro").as_ptr(),
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -1027,7 +1059,7 @@ impl Ui {
         }
         self.last_good = self.cfg.clone();
         if let Some(e) = self.cfg_error.clone() {
-            self.set_status(&format!("Config file error: {e}"), ERR);
+            self.set_status(&format!("配置文件错误：{e}"), ERR);
         }
     }
 
@@ -1112,19 +1144,35 @@ impl Ui {
         }
     }
 
+    /// Gen-2 dome dongle LED slots to display: explicit config first, else live dongle readback.
+    pub(crate) fn shown_dongle_leds(&self) -> Option<[u8; 3]> {
+        self.cfg.dongle.led_codes().ok().flatten().or(self.dongle_leds)
+    }
+
+    /// Gen-2 dome dongle brightness to display: explicit config first, else live dongle readback.
+    pub(crate) fn shown_dongle_bright(&self) -> Option<u8> {
+        self.cfg.dongle.brightness.or(self.dongle_bright)
+    }
+
     /// Firmware, serial, profiles, macro memory and the dongle's pairings.
     fn read_details(&mut self, ident: bool, pair: bool) {
         self.io(move |dev| {
             let Ok(m) = dev.mouse() else { return Box::new(|ui: &mut Ui| ui.reading = false) };
-            let ident = ident
-                .then(|| (m.firmware().ok(), m.dongle_firmware().ok(), m.serial().ok(), m.profiles().ok(), m.macro_storage().ok(), m.macro_support().ok()));
+            let ident = ident.then(|| {
+                let gen2 = (m.is_wireless() && m.spec().dongle == DongleKind::Gen2Dome).then(|| (m.dongle_leds().ok(), m.dongle_led_brightness().ok()));
+                (m.firmware().ok(), m.dongle_firmware().ok(), gen2, m.serial().ok(), m.profiles().ok(), m.macro_storage().ok(), m.macro_support().ok())
+            });
             let paired = if pair && m.is_wireless() { Some(m.paired_devices().ok()) } else { None };
             let auto = if paired.is_some() { dev.auto_pairing() } else { None };
             Box::new(move |ui: &mut Ui| {
                 ui.reading = false;
-                if let Some((fw, dfw, serial, profiles, storage, onboard)) = ident {
+                if let Some((fw, dfw, gen2, serial, profiles, storage, onboard)) = ident {
                     ui.fw = fw;
                     ui.dongle_fw = dfw;
+                    if let Some((leds, br)) = gen2 {
+                        ui.dongle_leds = leds;
+                        ui.dongle_bright = br;
+                    }
                     ui.serial = serial;
                     ui.profiles = profiles;
                     ui.macro_storage = storage;
@@ -1182,6 +1230,12 @@ impl Ui {
 
     unsafe fn tick(&mut self) {
         let mut repaint = false;
+        let auto = autostart::is_enabled();
+        if auto != self.autostart {
+            self.autostart = auto;
+            self.layout();
+            repaint = true;
+        }
         if self.pending && user_active() {
             self.retry_pending();
         }
@@ -1312,7 +1366,7 @@ impl Ui {
             if *p == Page::Calibration && !self.spec.sensor_tracking {
                 continue; // the tracking page of src/sensor.rs is not known to apply to this mouse
             }
-            if *p == Page::Power && !self.spec.battery && !self.spec.pairing {
+            if *p == Page::Power && !self.spec.battery && self.spec.dongle == DongleKind::None {
                 continue; // wired only: no battery, sleep or dongle settings to show
             }
             self.widgets.push(Widget {
@@ -1373,7 +1427,7 @@ impl Ui {
                     SendMessageW(h, WM_SETFONT, self.fonts.body as usize, 1);
                     if wgt.id == Id::GameFilter {
                         // EM_SETCUEBANNER: placeholder text while the box is empty.
-                        SendMessageW(h, 0x1501, 1, wide("Search games").as_ptr() as isize);
+                        SendMessageW(h, 0x1501, 1, wide("搜索已安装的游戏...").as_ptr() as isize);
                     }
                     let old = SetWindowLongPtrW(h, GWLP_WNDPROC, edit_proc as *const () as usize as isize);
                     if OLD_EDIT_PROC.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -1416,6 +1470,10 @@ impl Ui {
         let new = (self.scroll + dy).clamp(0, max_scroll);
         if new != self.scroll {
             self.scroll = new;
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            ScreenToClient(self.hwnd, &mut pt);
+            self.hot = self.hit(pt.x, pt.y);
             self.sync_edits();
             InvalidateRect(self.hwnd, ptr::null(), 0);
         }
@@ -1518,7 +1576,7 @@ impl Ui {
             if self.pending {
                 let x = left + s(MARGIN);
                 icon(dc, self.fonts.icon_sm, x + s(6), fy + s(FOOTER_H) / 2, Icon::Info, WARN);
-                text(dc, &rect(x + s(22), fy, w - x - s(40), s(FOOTER_H)), "Changes pending: move the mouse to wake it up", self.fonts.small, WARN, DT_ROW);
+                text(dc, &rect(x + s(22), fy, w - x - s(40), s(FOOTER_H)), "更改待同步：请移动鼠标唤醒后自动写入板载内存", self.fonts.small, WARN, DT_ROW);
             }
             return;
         };
@@ -1564,16 +1622,15 @@ impl Ui {
         let tile = rect(s(16), cy - s(12), s(24), s(24));
         round(dc, &tile, s(5), Some(ACCENT), None);
         logo_mark(dc, tile.left, tile.top, s(24), ON_ACCENT, ON_ACCENT);
-        text(dc, &rect(s(50), cy - s(14), sw - s(60), s(24)), "freenapse", self.fonts.logo, TEXT, DT_ROW);
-        text(dc, &rect(s(51), cy + s(8), sw - s(60), s(16)), "Mouse control", self.fonts.small, DIM, DT_ROW);
+        text(dc, &rect(s(50), cy - s(14), sw - s(60), s(24)), "Freenapse", self.fonts.logo, TEXT, DT_ROW);
+        text(dc, &rect(s(51), cy + s(8), sw - s(60), s(16)), "DeathAdder V4 Pro", self.fonts.small, DIM, DT_ROW);
 
         // Device card.
         let ch = s(DEVICE_CARD_H);
         let cr = rect(s(NAV_PAD), h - s(FOOTER_H) - ch - s(4), sw - s(2 * NAV_PAD), ch);
         card(dc, &cr, s(4));
         let online = self.connected && !self.asleep;
-        let model = if self.spec.is_placeholder() { "No mouse yet" } else { self.spec.name.trim_start_matches("Razer ").split(" (").next().unwrap_or("Mouse") }
-            .to_string();
+        let model = if self.spec.is_placeholder() { "未检测到鼠标".into() } else { display_model(&self.spec.name) };
         text(dc, &rect(cr.left + s(16), cr.top + s(12), cr.right - cr.left - s(52), s(20)), &model, self.fonts.bold, TEXT, DT_ROW);
         let (licon, lcol) = match (self.connected, self.asleep, self.wireless) {
             (false, _, _) => (Icon::Warning, DIM),
@@ -1583,31 +1640,31 @@ impl Ui {
         };
         icon(dc, self.fonts.icon, cr.right - s(24), cr.top + s(22), licon, lcol);
         let sub = match (self.connected, self.asleep) {
-            (false, _) => "Not connected".to_string(),
-            (true, true) => "Asleep, move it to wake".to_string(),
+            (false, _) => "未连接".to_string(),
+            (true, true) => "已休眠，移动鼠标唤醒".to_string(),
             (true, false) => match (self.fw, self.dongle_fw) {
-                (Some((a, b)), Some((c, d))) => format!("fw {a}.{b}  ·  dongle {c}.{d}"),
-                (Some((a, b)), None) => format!("Firmware {a}.{b}"),
+                (Some((a, b)), Some((c, d))) => format!("固件 {a}.{b}  ·  接收器 {c}.{d}"),
+                (Some((a, b)), None) => format!("固件版本 {a}.{b}"),
                 _ => {
                     if self.wireless {
-                        "HyperSpeed wireless".to_string()
+                        "HyperSpeed 无线连接".to_string()
                     } else {
-                        "Wired".to_string()
+                        "有线连接".to_string()
                     }
                 }
             },
         };
         // An unverified mouse says so wherever the window is: read-only, or being tested by its owner.
         let sub = if self.connected && !self.spec.verified && !self.spec.is_placeholder() {
-            format!("{}  ·  {sub}", if self.cfg.device.allow_unverified.allows(self.spec.product_id) { "Testing" } else { "Read-only" })
+            format!("{}  ·  {sub}", if self.cfg.device.allow_unverified.allows(self.spec.product_id) { "测试模式" } else { "只读模式" })
         } else {
             sub
         };
         text(dc, &rect(cr.left + s(16), cr.top + s(32), cr.right - cr.left - s(32), s(16)), &sub, self.fonts.small, MUTED, DT_ROW);
         // Battery bar with the percentage at its right.
         let (bcol, pct, label) = match self.battery {
-            Some(b) if b.wired => (BLUE, 100, "wired".to_string()),
-            Some(b) if b.charging => (BLUE, b.percent as i32, format!("{}% charging", b.percent)),
+            Some(b) if b.wired => (BLUE, 100, "有线供电".to_string()),
+            Some(b) if b.charging => (BLUE, b.percent as i32, format!("{}% 充电中", b.percent)),
             Some(b) if b.percent as u32 <= self.cfg.tray.notify_percent as u32 => (WARN, b.percent as i32, format!("{}%", b.percent)),
             Some(b) => (ACCENT, b.percent as i32, format!("{}%", b.percent)),
             None => (DIM, 0, "--".to_string()),
@@ -1671,12 +1728,16 @@ impl Ui {
                 let cx = if *on { r.right - s(4) - s(6) } else { r.left + s(4) + s(6) };
                 circle(dc, cx, r.top + h / 2, kr, Some(if *on { ON_ACCENT } else { MUTED }), None);
             }
-            Kind::Chips { options, selected, xs } => {
-                // DESIGN.md 4.9: flat chips, the selected one filled with the accent.
-                let hot_i = if hot { self.chip_at(wgt, self.cursor_x_in(wgt)) } else { None };
-                let h = r.bottom - r.top;
-                for (i, (x0, x1)) in xs.iter().enumerate() {
-                    let cr = rect(r.left + x0, r.top, x1 - x0, h);
+            Kind::Chips { options, selected, rects } => {
+                // DESIGN.md 4.9: flat chips (wrapping cleanly across rows), selected filled with accent.
+                let hot_i = if hot {
+                    let (cx, cy) = self.cursor_client_rel(r);
+                    self.chip_at(wgt, cx, cy)
+                } else {
+                    None
+                };
+                for (i, rel) in rects.iter().enumerate() {
+                    let cr = rect(r.left + rel.left, r.top + rel.top, rel.right - rel.left, rel.bottom - rel.top);
                     if *selected == Some(i) {
                         round(dc, &cr, s(4), Some(if hot_i == Some(i) { ACCENT_HI } else { ACCENT }), None);
                         text(dc, &cr, &options[i], self.fonts.bold, ON_ACCENT, DT_MID);
@@ -2016,7 +2077,7 @@ impl Ui {
             text(dc, &rect(r.left + s(6), y - s(9), s(36), s(18)), &label, self.fonts.small, MUTED, DT_ROW);
         }
         // Axis names.
-        text(dc, &rect(plot.right - s(60), plot.top + s(2), s(58), s(16)), "speed", self.fonts.small, DIM, DT_ROW);
+        text(dc, &rect(plot.right - s(60), plot.top + s(2), s(58), s(16)), "移动速度", self.fonts.small, DIM, DT_ROW);
         // The curve: sample i is speed i+1; the point at speed 0 is the first control point.
         let color = if editable { ACCENT } else { BLUE };
         let mut pts: Vec<POINT> = Vec::with_capacity(accel::MAX_SPEED as usize + 1);
@@ -2086,10 +2147,10 @@ impl Ui {
         reflection(dc, &shell, 24);
         let tx = x + bw + s(28);
         let (big, small) = match self.battery {
-            Some(b) if b.wired => ("Wired".to_string(), "No battery: powered by the cable".to_string()),
-            Some(b) => (format!("{}%", b.percent), if b.charging { "Charging".to_string() } else { "On battery".to_string() }),
-            None if self.asleep => ("--".to_string(), "Mouse asleep: move it to refresh".to_string()),
-            None => ("--".to_string(), "Mouse not connected".to_string()),
+            Some(b) if b.wired => ("有线供电".to_string(), "无内置电池：由 USB 线缆直接供电".to_string()),
+            Some(b) => (format!("{}%", b.percent), if b.charging { "正在充电".to_string() } else { "无线电池供电中".to_string() }),
+            None if self.asleep => ("--".to_string(), "鼠标休眠中：移动鼠标以刷新电量".to_string()),
+            None => ("--".to_string(), "未检测到鼠标连接".to_string()),
         };
         text(dc, &rect(tx, y - s(8), r.right - tx, s(48)), &big, self.fonts.big, TEXT, DT_ROW);
         text(dc, &rect(tx, y + s(36), r.right - tx, s(20)), &small, self.fonts.body, MUTED, DT_ROW);
@@ -2099,21 +2160,21 @@ impl Ui {
     // Hit testing and interaction
     // ------------------------------------------------------------------
 
-    fn cursor_x_in(&self, wgt: &Widget) -> i32 {
+    fn cursor_client_rel(&self, client_r: &RECT) -> (i32, i32) {
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
             GetCursorPos(&mut pt);
             ScreenToClient(self.hwnd, &mut pt);
         }
-        pt.x - wgt.rect.left
+        (pt.x - client_r.left, pt.y - client_r.top)
     }
 
-    fn chip_at(&self, wgt: &Widget, x_rel: i32) -> Option<usize> {
-        let xs = match &wgt.kind {
-            Kind::Chips { xs, .. } => xs,
+    fn chip_at(&self, wgt: &Widget, x_rel: i32, y_rel: i32) -> Option<usize> {
+        let rects = match &wgt.kind {
+            Kind::Chips { rects, .. } => rects,
             _ => return None,
         };
-        xs.iter().position(|(a, b)| x_rel >= *a && x_rel < *b)
+        rects.iter().position(|r| contains(r, x_rel, y_rel))
     }
 
     fn track_span(&self, wgt: &Widget, r: &RECT) -> (i32, i32) {
@@ -2180,9 +2241,10 @@ impl Ui {
         let id = self.widgets[i].id;
         let wgt = &self.widgets[i];
         let py = y - self.content_top() + self.scroll;
+        let wy = if wgt.fixed { y } else { py };
         let act = match &wgt.kind {
             Kind::Toggle { on } => Act::Toggle(!*on),
-            Kind::Chips { .. } => Act::Chip(self.chip_at(wgt, x - wgt.rect.left)),
+            Kind::Chips { .. } => Act::Chip(self.chip_at(wgt, x - wgt.rect.left, wy - wgt.rect.top)),
             Kind::Slider { .. } => Act::Slider(self.slider_value_at(wgt, x)),
             Kind::Button { .. } => Act::Button,
             Kind::Radio { .. } | Kind::Row { .. } | Kind::Nav { .. } | Kind::Tile { .. } | Kind::Link { .. } => Act::Click,
@@ -2488,7 +2550,7 @@ impl Ui {
         self.scanning = false;
         if manual {
             let n = self.library.len();
-            self.set_status(&format!("Found {n} installed game{}", if n == 1 { "" } else { "s" }), ACCENT);
+            self.set_status(&format!("已扫描到 {n} 款已安装游戏"), ACCENT);
         }
         self.layout();
         InvalidateRect(self.hwnd, ptr::null(), 0);
@@ -2566,13 +2628,13 @@ impl Ui {
         let n = self.cfg.games.len();
         self.commit(Write::None);
         if self.cfg.games.len() == n {
-            self.set_status(&format!("Profile created for {name}: pick its DPI stage and polling rate"), ACCENT);
+            self.set_status(&format!("已为《{name}》创建配置：可单独设置 DPI 档位、回报率与按键布局"), ACCENT);
         }
     }
 
     /// Ask for a program with the standard Open dialog and give it a profile.
     unsafe fn browse_program(&mut self) {
-        if let Some(path) = self.open_dialog("Choose the game's program", "Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0") {
+        if let Some(path) = self.open_dialog("选择游戏或应用程序可执行文件", "程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0\0") {
             self.add_program(&path);
         }
     }
@@ -2612,7 +2674,7 @@ impl Ui {
             self.sel_game = i;
             self.game_open = true;
             self.scroll_to = Some(Id::GameRow(i));
-            self.set_status(&format!("{exe} already has a profile"), WARN);
+            self.set_status(&format!("{exe} 已存在对应的游戏配置"), WARN);
             self.layout();
             InvalidateRect(self.hwnd, ptr::null(), 0);
             return;
@@ -2690,7 +2752,7 @@ impl Ui {
         self.rec_count = 0;
         self.rec_secs = 0;
         SetTimer(self.hwnd, TIMER_RECORD, 10, None);
-        self.set_status("Recording: press keys and mouse buttons, then click Stop or press Esc", WARN);
+        self.set_status("正在录制宏：请按下键盘或鼠标按键，完成后点击“停止录制”或按 Esc", WARN);
         self.layout();
         InvalidateRect(self.hwnd, ptr::null(), 0);
     }
@@ -2716,7 +2778,7 @@ impl Ui {
         let Some((rec, id)) = self.recording.take() else { return };
         let events = rec.finish();
         if events.is_empty() {
-            self.set_status("Nothing recorded; the macro is unchanged", WARN);
+            self.set_status("未录制到任何操作，宏保持不变", WARN);
             self.layout();
             InvalidateRect(self.hwnd, ptr::null(), 0);
             return;
@@ -2725,7 +2787,7 @@ impl Ui {
         match self.cfg.macros.iter_mut().find(|m| m.id == id) {
             Some(m) => m.events = specs,
             None => {
-                self.cfg.macros.push(MacroConfig { id, name: format!("Macro {id}"), events: specs });
+                self.cfg.macros.push(MacroConfig { id, name: format!("宏 {id}"), events: specs });
                 self.sel_macro = Some(self.cfg.macros.len() - 1);
             }
         }
@@ -2978,7 +3040,7 @@ impl Ui {
                 if self.sel_game < self.cfg.games.len() {
                     // A launcher game goes back to the installed games list.
                     let name = self.cfg.games.remove(self.sel_game).label();
-                    self.set_status(&format!("Profile of {name} removed"), ACCENT);
+                    self.set_status(&format!("已移除《{name}》的游戏配置"), ACCENT);
                     self.game_open = false;
                     self.sel_game = self.sel_game.min(self.cfg.games.len().saturating_sub(1));
                     if let Layer::Game(_) = self.layer {
@@ -3008,7 +3070,7 @@ impl Ui {
             Id::Unpair => {
                 if !self.confirm_unpair {
                     self.confirm_unpair = true;
-                    self.set_status("Unpairing stops the mouse working until it is paired again. Click \"Yes, unpair\" to confirm", WARN);
+                    self.set_status("取消配对后鼠标将断开，直到重新配对。再次点击“确认取消配对”以执行", WARN);
                     self.layout();
                     InvalidateRect(self.hwnd, ptr::null(), 0);
                     return;
@@ -3020,21 +3082,16 @@ impl Ui {
             Id::AllowUnverified => {
                 let on = v == 1;
                 if on {
-                    // Switching on asks first, in a dialog nobody can miss; Cancel is the default.
-                    let model = self.spec.name.split(" (").next().unwrap_or(&self.spec.name).to_string();
+                    let model = display_model(&self.spec.name);
                     let text = format!(
-                        "Nobody has confirmed writes on the {model} (product id 0x{:04x}) yet.\n\n\
-                         If you continue, freenapse sends the changes you make to this mouse. A setting the mouse \
-                         takes the wrong way may have to be put back with Razer Synapse.\n\n\
-                         Allow writes to this mouse, at your own risk?",
+                        "{model}（产品 ID 0x{:04x}）尚未在设备表中标记为已验证。\n\n\
+                         继续开启后，freenapse 会将你的更改写入鼠标板载内存。若个别设置不兼容，\
+                         可随时恢复之前的配置或通过雷云重置。\n\n\
+                         确认开启此鼠标的写入权限吗？",
                         self.spec.product_id
                     );
-                    let answer = MessageBoxW(
-                        self.hwnd,
-                        wide(&text).as_ptr(),
-                        wide("Allow writes to an unverified mouse").as_ptr(),
-                        MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
-                    );
+                    let answer =
+                        MessageBoxW(self.hwnd, wide(&text).as_ptr(), wide("开启未验证鼠标写入权限").as_ptr(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
                     if answer != IDOK {
                         return;
                     }
@@ -3052,7 +3109,7 @@ impl Ui {
                 if self.cfg.device.allow_unverified.allows(self.spec.product_id) != on {
                     return; // the config was rejected and put back; commit said why
                 }
-                let msg = if on { "Writes to this mouse are on: changes you make are now sent to it" } else { "This mouse is read-only again" };
+                let msg = if on { "已开启写入权限：你在此处修改的设置将立即写入鼠标" } else { "已恢复为只读安全模式" };
                 self.set_status(msg, if on { WARN } else { ACCENT });
                 InvalidateRect(self.hwnd, ptr::null(), 0);
                 return;
@@ -3151,6 +3208,38 @@ impl Ui {
                 self.cfg.dongle.led = (v + 1).clamp(1, 3) as u8;
                 Write::DongleLed
             }
+            Id::DongleLedSlot(slot) => {
+                let Some((new_code, new_name, _)) = DONGLE_LED_SLOTS.get((v as usize).min(DONGLE_LED_SLOTS.len() - 1)).copied() else {
+                    return;
+                };
+                let slot = slot.min(2);
+                let Some(mut codes) = self.shown_dongle_leds() else {
+                    // Current 3-LED array is still unknown (`leds = []` and initial GET not done yet):
+                    // read the real 3 slots on the I/O thread first so we never overwrite the other two with defaults.
+                    self.patch_dongle_led_slot(slot, new_code);
+                    return;
+                };
+                if codes[slot] == new_code {
+                    return;
+                }
+                codes[slot] = new_code;
+                self.dongle_leds = Some(codes);
+                if self.cfg.dongle.leds.len() != 3 {
+                    self.cfg.dongle.leds = codes.map(|c| crate::device::dongle_led_slot_name(c).to_string()).to_vec();
+                } else {
+                    self.cfg.dongle.leds[slot] = new_name.to_string();
+                }
+                Write::DongleLeds
+            }
+            Id::DongleLedBright => {
+                let lv = v.clamp(0, 4) as u8;
+                if self.shown_dongle_bright() == Some(lv) {
+                    return;
+                }
+                self.cfg.dongle.brightness = Some(lv);
+                self.dongle_bright = Some(lv);
+                Write::DongleBright
+            }
             Id::NotifyPercent => {
                 self.cfg.tray.notify_percent = v.clamp(5, 50) as u8;
                 Write::None
@@ -3159,11 +3248,34 @@ impl Ui {
                 self.cfg.tray.poll_seconds = v.clamp(10, 600) as u32;
                 Write::None
             }
+            Id::OnboardOnly => {
+                let on = v == 1;
+                if self.cfg.tray.onboard_only == on {
+                    return;
+                }
+                self.cfg.tray.onboard_only = on;
+                self.set_status(
+                    if on {
+                        "已开启纯板载反作弊模式：已彻底禁用软件宏键盘钩子与 SendInput 模拟输入"
+                    } else {
+                        "已关闭纯板载模式：允许按需使用软件宏与文本输入"
+                    },
+                    ACCENT,
+                );
+                if self.cfg.soft_macro_slots().is_empty() { Write::None } else { Write::Button(0, false) }
+            }
             Id::Autostart => {
                 match autostart::set(v == 1) {
                     Ok(()) => {
                         self.autostart = v == 1;
-                        self.set_status(if v == 1 { "The tray app will start at login" } else { "Autostart disabled" }, ACCENT);
+                        self.set_status(
+                            if v == 1 {
+                                "已开启开机静默自启（登录 Windows 时无弹窗驻留右下角托盘）"
+                            } else {
+                                "已关闭开机自动启动"
+                            },
+                            ACCENT,
+                        );
                     }
                     Err(e) => self.set_status(&e, ERR),
                 }
@@ -3217,37 +3329,37 @@ impl Ui {
                 let key = self.button_key();
                 self.key_mode = None;
                 self.text_mode = None;
-                let spec = match pages::CATEGORIES[c] {
-                    "Default" => None,
-                    "Mouse" => {
+                let spec = match c {
+                    0 => None,
+                    pages::CAT_MOUSE => {
                         // A button that clicks keeps its own click; the others start from left click.
                         let own = self.sel().name;
                         Some(format!("mouse:{}", if crate::device::button_code(own).is_some() { own } else { "left" }))
                     }
-                    "Keyboard" => {
+                    pages::CAT_KEYBOARD => {
                         // Show the key box; nothing is written until a key name is typed.
-                        if !self.layer_buttons().get(&key).is_some_and(|s| s.starts_with("key:")) {
-                            self.key_mode = Some(key);
-                        }
+                        self.key_mode = Some(key);
                         self.layout();
                         InvalidateRect(self.hwnd, ptr::null(), 0);
                         return;
                     }
-                    "DPI" => Some("dpi-up".to_string()),
-                    "Multimedia" => Some("media:play-pause".to_string()),
-                    "System" => Some("system:sleep".to_string()),
-                    "Macro" => {
+                    pages::CAT_DPI => Some("dpi-up".to_string()),
+                    pages::CAT_MEDIA => Some("media:play-pause".to_string()),
+                    pages::CAT_SHORTCUT => Some("key:win+d".to_string()),
+                    pages::CAT_SYSTEM => Some("system:sleep".to_string()),
+                    pages::CAT_MACRO => {
                         let Some(m) = self.cfg.macros.first() else {
-                            self.set_status("No macros yet: record one in the MACROS section below", WARN);
+                            self.set_status("尚未创建任何宏：请先在下方“宏录制”区域录制一个宏", WARN);
                             self.layout();
                             InvalidateRect(self.hwnd, ptr::null(), 0);
                             return;
                         };
                         Some(macro_spec(m.id, Playback::Times(1)))
                     }
-                    "Program" => {
+                    pages::CAT_LAUNCH => {
                         // A one-step macro that the tray app plays: pick the program now.
-                        let Some(path) = self.open_dialog("Program to start with this button", "Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0") else {
+                        let Some(path) = self.open_dialog("选择按下此按键时要启动的程序", "程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0\0")
+                        else {
                             self.layout();
                             InvalidateRect(self.hwnd, ptr::null(), 0);
                             return;
@@ -3256,14 +3368,14 @@ impl Ui {
                         let id = self.cfg.ensure_step_macro(&step, &crate::macros::launch_label(&path));
                         Some(macro_spec(id, Playback::Times(1)))
                     }
-                    "Text" => {
+                    pages::CAT_TEXT => {
                         // Show the text box; nothing is written until a text is typed.
                         self.text_mode = Some(key);
                         self.layout();
                         InvalidateRect(self.hwnd, ptr::null(), 0);
                         return;
                     }
-                    "Hypershift" => Some("hypershift".to_string()),
+                    pages::CAT_HYPERSHIFT => Some("hypershift".to_string()),
                     _ => Some("disabled".to_string()),
                 };
                 match spec {
@@ -3291,7 +3403,8 @@ impl Ui {
                 } else {
                     let opts = pages::options_for(cat, self.cfg.dpi.stages.len());
                     if let Some((_, spec)) = opts.get(v as usize) {
-                        self.layer_buttons_mut().insert(key, pages::with_turbo(spec, rate));
+                        let out = if cat == pages::CAT_SHORTCUT { spec.clone() } else { pages::with_turbo(spec, rate) };
+                        self.layer_buttons_mut().insert(key, out);
                     }
                 }
                 self.button_write()
@@ -3322,12 +3435,47 @@ impl Ui {
         }
     }
 
+    /// Read the Gen-2 dome dongle's live 3-LED array first, modify only `slot`, write if needed,
+    /// and save the merged 3-element array to `config.toml` only after the read succeeds.
+    unsafe fn patch_dongle_led_slot(&mut self, slot: usize, new_code: u8) {
+        self.set_status("正在读取接收器当前灯位并更新...", MUTED);
+        self.layout();
+        InvalidateRect(self.hwnd, ptr::null(), 0);
+        self.io(move |dev| {
+            let res: Result<[u8; 3], HidError> = dev.mouse().and_then(|m| {
+                let mut cur = m.dongle_leds()?;
+                cur[slot.min(2)] = new_code;
+                m.sync_dongle_leds(cur)?;
+                Ok(cur)
+            });
+            let unit_res = res.as_ref().map(|_| ()).map_err(Clone::clone);
+            dev.check(&unit_res);
+            Box::new(move |ui: &mut Ui| unsafe {
+                match res {
+                    Ok(codes) => {
+                        ui.dongle_leds = Some(codes);
+                        ui.cfg.dongle.leds = codes.map(|c| crate::device::dongle_led_slot_name(c).to_string()).to_vec();
+                        if let Err(e) = Config::write_new(&config_path(), &ui.cfg) {
+                            ui.set_status(&e, ERR);
+                        } else {
+                            ui.last_good = ui.cfg.clone();
+                        }
+                        ui.write_done(Write::DongleLeds, Ok(()), None, None, None);
+                    }
+                    Err(e) => {
+                        ui.write_done(Write::DongleLeds, Err(e), None, None, None);
+                    }
+                }
+            })
+        });
+    }
+
     /// Save the config file and write the changed setting to the mouse. A
     /// change the config rejects (for example losing the last left click) is
     /// undone in the window too.
     unsafe fn commit(&mut self, write: Write) {
         if let Err(e) = self.cfg.validate_for(&self.spec) {
-            self.set_status(&format!("Not changed: {e}"), ERR);
+            self.set_status(&format!("更改无效：{e}"), ERR);
             self.cfg = self.last_good.clone();
             self.key_mode = None;
             self.layout();
@@ -3340,7 +3488,7 @@ impl Ui {
         self.last_good = self.cfg.clone();
         if write != Write::None {
             // The window updates now; the mouse is written in the background (write_done follows).
-            self.set_status("Saving to the mouse...", MUTED);
+            self.set_status("正在写入鼠标板载内存...", MUTED);
             let cfg = self.cfg.clone();
             self.io(move |dev| {
                 let result = dev.mouse().and_then(|m| Self::write_to(m, &cfg, write));
@@ -3380,10 +3528,24 @@ impl Ui {
                         m.set_dongle_led_mode(cfg.dongle.led)?;
                     }
                 }
+                Write::DongleLeds => {
+                    if m.is_wireless() && m.spec().dongle == DongleKind::Gen2Dome {
+                        if let Some(leds) = cfg.dongle.led_codes().map_err(HidError::Invalid)? {
+                            m.sync_dongle_leds(leds)?;
+                        }
+                    }
+                }
+                Write::DongleBright => {
+                    if m.is_wireless() && m.spec().dongle == DongleKind::Gen2Dome {
+                        if let Some(br) = cfg.dongle.brightness {
+                            m.sync_dongle_led_brightness(br)?;
+                        }
+                    }
+                }
                 Write::Tracking => {
                     if let Ok(Some(t)) = cfg.tracking() {
                         let plan = t.plan().map_err(|_| HidError::Unsupported("invalid tracking"))?;
-                        m.apply_tracking(&plan)?;
+                        m.sync_tracking(&plan)?;
                     }
                 }
                 Write::Accel => {
@@ -3462,32 +3624,33 @@ impl Ui {
                 self.connected = true;
                 self.asleep = false;
                 let msg = match write {
-                    Write::Stages => "DPI saved to the mouse",
-                    Write::Polling => "Polling rate saved to the mouse",
-                    Write::Tracking => "Tracking settings saved to the mouse",
-                    Write::Accel => "Dynamic Sensitivity saved to the mouse",
-                    Write::Lighting => "Lighting saved to the mouse",
-                    Write::Profile => "Onboard profile selected and the config written to it",
-                    Write::Button(..) => "Button assignment saved to the mouse",
+                    Write::Stages => "DPI 档位与灵敏度已保存至鼠标板载内存",
+                    Write::Polling => "回报率设置已保存至鼠标板载内存",
+                    Write::Tracking => "传感器抬起 / 着陆校准已保存至鼠标板载内存",
+                    Write::Accel => "动态灵敏度曲线已保存至鼠标板载内存",
+                    Write::Lighting => "灯光效果已保存至鼠标板载内存",
+                    Write::DongleLed | Write::DongleLeds => "无线接收器指示灯功能已保存",
+                    Write::DongleBright => "无线接收器指示灯亮度已保存",
+                    Write::Profile => "已切换板载配置文件并写入全部设置",
+                    Write::Button(..) => "按键映射已保存至鼠标板载内存",
                     Write::Macro(_) => {
                         if self.macro_onboard == Some(true) {
-                            "Macro stored in the mouse"
+                            "宏已存入鼠标板载内存"
                         } else {
-                            "Macro saved; the tray app plays it when its button is pressed"
+                            "宏已保存：按下绑定按键时由托盘程序执行（请保持托盘运行）"
                         }
                     }
-                    Write::MacroDelete(_) => "Macro deleted",
-                    Write::Pair(PairAct::Start) => "Dongle in pairing mode: switch the mouse off and on next to it",
-                    Write::Pair(PairAct::Cancel) => "Pairing mode cancelled",
-                    Write::Pair(PairAct::Unpair) => "Unpaired. Use \"Pair a device\" to pair the mouse again",
-                    Write::Pair(PairAct::Auto(_)) => "Auto-pairing setting saved to the dongle",
-                    _ => "Saved to the mouse",
+                    Write::MacroDelete(_) => "宏已删除",
+                    Write::Pair(PairAct::Start) => "接收器已进入配对模式：请靠近接收器将鼠标电源关开一次",
+                    Write::Pair(PairAct::Cancel) => "已取消配对模式",
+                    Write::Pair(PairAct::Unpair) => "已取消配对。如需重连请使用“配对设备”",
+                    Write::Pair(PairAct::Auto(_)) => "自动配对设置已保存至接收器",
+                    _ => "已保存至鼠标板载内存",
                 };
-                // Pairing steps and the plain message are their own headline.
-                if matches!(write, Write::Pair(_) | Write::MacroDelete(_)) || msg == "Saved to the mouse" {
+                if matches!(write, Write::Pair(_) | Write::MacroDelete(_)) || msg == "已保存至鼠标板载内存" {
                     self.set_status(msg, ACCENT);
                 } else {
-                    self.set_notice("Saved to the mouse", msg, ACCENT);
+                    self.set_notice("已保存至鼠标板载内存", msg, ACCENT);
                 }
                 true
             }
@@ -3495,40 +3658,31 @@ impl Ui {
                 self.connected = false;
                 self.battery = None;
                 self.pending = true;
-                self.set_notice(
-                    "Not on the mouse yet",
-                    "The mouse is not connected. The change is in the config file and is written when the mouse is back.",
-                    WARN,
-                );
+                self.set_notice("暂未写入鼠标", "未检测到鼠标连接。设置已保存至本地配置文件，鼠标重新连接后将自动同步写入。", WARN);
                 false
             }
             Err(HidError::Unverified(_)) => {
                 self.asleep = false;
                 self.pending = false;
-                self.set_notice(
-                    "Not saved to the mouse",
-                    "This mouse is not verified, so freenapse only reads it. Your change is in the config file, not in the mouse. \
-                     To write it, switch on \"Allow writes to this mouse\" on the Devices page.",
-                    ERR,
-                );
+                self.set_notice("未写入鼠标", "当前鼠标处于只读保护模式，更改仅保存在配置文件中。如需写入，请在“支持设备”页面开启写入开关。", ERR);
                 false
             }
             Err(HidError::Unsupported(e)) => {
                 self.asleep = false;
                 self.pending = false;
-                self.set_notice("Not saved to the mouse", &format!("The mouse rejected the change: {e}. It is in the config file only."), ERR);
+                self.set_notice("未写入鼠标", &format!("鼠标不支持该项更改：{e}。"), ERR);
                 false
             }
             Err(e) if is_asleep_error(&e) => {
                 self.asleep = true;
                 self.pending = true;
-                self.set_notice("Not on the mouse yet", "The mouse is asleep. Move it and the change is written.", WARN);
+                self.set_notice("等待鼠标唤醒", "无线鼠标当前处于休眠状态，轻微移动鼠标即可自动完成写入。", WARN);
                 false
             }
             Err(e) => {
                 self.asleep = false;
                 self.pending = false;
-                self.set_notice("Not saved to the mouse", &format!("The change is in the config file, but writing it to the mouse failed: {e}"), ERR);
+                self.set_notice("写入失败", &format!("更改已保存至配置文件，但写入鼠标失败：{e}"), ERR);
                 false
             }
         };
@@ -3569,7 +3723,7 @@ impl Ui {
                         ui.pending = false;
                         ui.asleep = false;
                         ui.connected = true;
-                        ui.set_status(if changes.is_empty() { "The mouse is up to date" } else { "Pending changes applied to the mouse" }, ACCENT);
+                        ui.set_status(if changes.is_empty() { "鼠标已是最新配置" } else { "待同步更改已写入鼠标板载内存" }, ACCENT);
                         if ui.owner != 0 {
                             unsafe { PostMessageW(ui.owner, WM_UI_CONFIG_CHANGED, 1, 0) };
                         }
@@ -3580,7 +3734,7 @@ impl Ui {
                     Err(e) => {
                         ui.pending = false;
                         ui.asleep = false;
-                        ui.set_status(&format!("Not applied to the mouse: {e}"), ERR);
+                        ui.set_status(&format!("未能应用到鼠标：{e}"), ERR);
                     }
                 }
                 ui.repaint();
@@ -3589,7 +3743,7 @@ impl Ui {
     }
 
     unsafe fn reimport(&mut self) {
-        self.set_status("Reading the mouse...", MUTED);
+        self.set_status("正在读取鼠标板载设置...", MUTED);
         self.io(|dev| {
             let result = dev.mouse().and_then(apply::import);
             dev.check(&result);
@@ -3604,14 +3758,14 @@ impl Ui {
                         if let Err(e) = Config::write_new(&config_path(), &ui.cfg) {
                             ui.set_status(&e, ERR);
                         } else {
-                            ui.set_status("Config rebuilt from the mouse's onboard settings", ACCENT);
+                            ui.set_status("已从鼠标板载内存重新导入全部设置", ACCENT);
                         }
                         if ui.owner != 0 {
                             unsafe { PostMessageW(ui.owner, WM_UI_CONFIG_CHANGED, 1, 0) };
                         }
                     }
-                    Err(HidError::NotFound) => ui.set_status("Mouse not connected", ERR),
-                    Err(e) => ui.set_status(&format!("Could not read the mouse: {e}"), ERR),
+                    Err(HidError::NotFound) => ui.set_status("未检测到鼠标连接", ERR),
+                    Err(e) => ui.set_status(&format!("读取鼠标失败：{e}"), ERR),
                 }
                 ui.repaint();
             })

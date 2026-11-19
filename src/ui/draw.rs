@@ -186,7 +186,7 @@ unsafe fn first_font(faces: &[&str], px: i32, weight: u32) -> HFONT {
         SelectObject(dc, old);
         ReleaseDC(0, dc);
         let got = String::from_utf16_lossy(&name[..n.max(1) as usize - 1]);
-        if got.eq_ignore_ascii_case(face) {
+        if got.eq_ignore_ascii_case(face) || (face.contains("YaHei") && (got.contains("雅黑") || got.contains("YaHei"))) {
             return f;
         }
         DeleteObject(f);
@@ -194,16 +194,16 @@ unsafe fn first_font(faces: &[&str], px: i32, weight: u32) -> HFONT {
     font(faces[faces.len() - 1], px, weight)
 }
 
-/// Segoe UI Variable at the given optical size; the semibold cut is its own
-/// GDI family, so it is asked for by name (Windows 10: Segoe UI Semibold).
+/// Microsoft YaHei UI for crisp Chinese + Latin ClearType rendering on Windows 10/11,
+/// with Segoe UI Variable / Segoe UI fallback.
 unsafe fn ui_font(face: Face, px: i32, semibold: bool) -> HFONT {
     let faces: &[&str] = match (face, semibold) {
-        (Face::Small, false) => &["Segoe UI Variable Small", "Segoe UI"],
-        (Face::Small, true) => &["Segoe UI Variable Small Semibol", "Segoe UI Semibold", "Segoe UI"],
-        (Face::Text, false) => &["Segoe UI Variable Text", "Segoe UI"],
-        (Face::Text, true) => &["Segoe UI Variable Text Semibold", "Segoe UI Semibold", "Segoe UI"],
-        (Face::Display, false) => &["Segoe UI Variable Display", "Segoe UI"],
-        (Face::Display, true) => &["Segoe UI Variable Display Semib", "Segoe UI Semibold", "Segoe UI"],
+        (Face::Small, false) => &["Microsoft YaHei UI", "Segoe UI Variable Small", "Segoe UI"],
+        (Face::Small, true) => &["Microsoft YaHei UI", "Segoe UI Variable Small Semibol", "Segoe UI Semibold", "Segoe UI"],
+        (Face::Text, false) => &["Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI"],
+        (Face::Text, true) => &["Microsoft YaHei UI", "Segoe UI Variable Text Semibold", "Segoe UI Semibold", "Segoe UI"],
+        (Face::Display, false) => &["Microsoft YaHei UI", "Segoe UI Variable Display", "Segoe UI"],
+        (Face::Display, true) => &["Microsoft YaHei UI", "Segoe UI Variable Display Semib", "Segoe UI Semibold", "Segoe UI"],
     };
     first_font(faces, px, if semibold { FW_SEMIBOLD } else { FW_NORMAL })
 }

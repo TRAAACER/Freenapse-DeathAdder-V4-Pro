@@ -1,2 +1,10 @@
 /target
 /.claude/settings.local.json
+/config.toml
+/config-*.toml
+/*.backup.toml
+/*.log
+/*.diff
+/*.patch
+/freenapse.exe
+/freenapse-crash.txt

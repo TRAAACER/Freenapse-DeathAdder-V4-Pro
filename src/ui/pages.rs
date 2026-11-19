@@ -7,10 +7,10 @@ use windows_sys::Win32::Graphics::Gdi::HDC;
 
 use super::draw::theme::*;
 use super::draw::*;
-use super::{FontKind, Id, Kind, Layer, Page, TileArt, TileItem, Ui, Widget};
+use super::{FontKind, Id, Kind, Layer, Page, TileArt, TileItem, Ui, Widget, display_model};
 use crate::accel::Mode;
 use crate::config::{MacroConfig, parse_button};
-use crate::device::{CLICK_CODES, DeviceSpec, PhysicalButton, TURBO_MAX, TURBO_MIN};
+use crate::device::{CLICK_CODES, DONGLE_LED_SLOTS, DeviceSpec, DongleKind, PhysicalButton, TURBO_MAX, TURBO_MIN};
 use crate::macros::{self, Playback};
 
 /// Card padding, the label column of a settings row, and the row heights (DESIGN.md 3.3, 4.6).
@@ -148,13 +148,18 @@ impl Form {
     /// Settings row (DESIGN.md 4.6): title in Body strong, description in Caption,
     /// a divider underneath; the caller puts the control at the right. Returns the row height.
     fn label(&mut self, title: &str, sub: &str) -> i32 {
+        self.label_min(title, sub, 0)
+    }
+
+    fn label_min(&mut self, title: &str, sub: &str, min_h: i32) -> i32 {
         let h = if sub.is_empty() {
             ROW_H
         } else {
             // The description wraps inside the label column; the row grows with it.
             let lines = (self.measure(self.body, sub) * 12 / 14 / (LABEL_W - 16) + 1).clamp(1, 3);
             ROW_H_SUB + 16 * (lines - 1)
-        };
+        }
+        .max(min_h);
         if sub.is_empty() {
             self.push(
                 Id::None,
@@ -228,28 +233,37 @@ impl Form {
         self.y += h;
     }
 
-    /// Chip spans for `options`, relative to the group's left edge; returns the spans and the total width.
-    fn chip_spans(&self, options: &[String]) -> (Vec<(i32, i32)>, i32) {
-        let mut xs = Vec::new();
+    /// Chip boxes wrapped into rows of at most `max_w` logical units; returns `(scaled_rects, used_w, total_h)`.
+    fn chip_rects(&self, options: &[String], max_w: i32) -> (Vec<RECT>, i32, i32) {
+        let mut rects = Vec::with_capacity(options.len());
+        let limit = max_w.max(60);
         let mut x = 0;
+        let mut y = 0;
+        let mut used_w = 0;
         for o in options {
-            let w = self.measure(self.body, o) + 24;
-            xs.push((self.s(x), self.s(x + w)));
+            let w = (self.measure(self.body, o) + 20).min(limit);
+            if x > 0 && x + w > limit {
+                x = 0;
+                y += CHIP_H + 8;
+            }
+            rects.push(RECT { left: self.s(x), top: self.s(y), right: self.s(x + w), bottom: self.s(y + CHIP_H) });
+            used_w = used_w.max(x + w);
             x += w + 8;
         }
-        (xs, (x - 8).max(0))
+        let total_h = if options.is_empty() { CHIP_H } else { y + CHIP_H };
+        (rects, used_w, total_h)
     }
 
-    /// Chips right-aligned in a settings row.
+    /// Chips right-aligned in a settings row (wrapping inside the control column when narrow).
     pub fn chips(&mut self, title: &str, sub: &str, options: &[String], selected: Option<usize>, id: Id) {
-        let h = self.label(title, sub);
-        let (xs, total) = self.chip_spans(options);
-        let w = total.min(self.cw());
-        self.push(id, self.right() - w, self.y + (h - CHIP_H) / 2, w, CHIP_H, Kind::Chips { options: options.to_vec(), selected, xs });
+        let (rects, used_w, total_h) = self.chip_rects(options, self.cw());
+        let h = self.label_min(title, sub, total_h + 16);
+        let w = used_w.min(self.cw());
+        self.push(id, self.right() - w, self.y + (h - total_h) / 2, w, total_h, Kind::Chips { options: options.to_vec(), selected, rects });
         self.y += h;
     }
 
-    /// Chips spanning the whole card width, with the title on its own line (for long option lists).
+    /// Chips spanning the whole card width, wrapping onto multiple lines so long lists never overflow.
     pub fn chips_wide(&mut self, title: &str, options: &[String], selected: Option<usize>, id: Id) {
         if !title.is_empty() {
             self.push(
@@ -262,9 +276,10 @@ impl Form {
             );
             self.y += 28;
         }
-        let (xs, _) = self.chip_spans(options);
-        self.push(id, self.x + PAD, self.y, self.w - 2 * PAD, CHIP_H, Kind::Chips { options: options.to_vec(), selected, xs });
-        self.y += CHIP_H + 12;
+        let avail_w = self.w - 2 * PAD;
+        let (rects, _, total_h) = self.chip_rects(options, avail_w);
+        self.push(id, self.x + PAD, self.y, avail_w, total_h, Kind::Chips { options: options.to_vec(), selected, rects });
+        self.y += total_h + 12;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -329,9 +344,9 @@ impl Form {
     /// With `y`, a second row for the vertical DPI follows (independent X/Y).
     pub fn stage(&mut self, i: usize, dpi: u16, y: Option<u16>, active: bool, selectable: bool, dpi_max: u16) {
         let h = ROW_H;
-        let title = if selectable { format!("Stage {}", i + 1) } else { "Sensitivity".to_string() };
-        let title = if y.is_some() { format!("{title}  ·  X") } else { title };
-        let title = if active && selectable { format!("{title}  ·  Active") } else { title };
+        let title = if selectable { format!("档位 {}", i + 1) } else { "当前灵敏度 (DPI)".to_string() };
+        let title = if y.is_some() { format!("{title}  ·  X 轴") } else { title };
+        let title = if active && selectable { format!("{title}  ·  当前使用") } else { title };
         if selectable {
             self.push(Id::StageActive(i), self.x + PAD, self.y, LABEL_W - 10, h, Kind::Radio { on: active, text: title });
         } else {
@@ -346,7 +361,7 @@ impl Form {
                 self.y,
                 LABEL_W - 38,
                 h,
-                Kind::Text { text: "Y".to_string(), font: FontKind::Body, color: MUTED, flags: DT_ROW },
+                Kind::Text { text: "Y 轴".to_string(), font: FontKind::Body, color: MUTED, flags: DT_ROW },
             );
             self.dpi_controls(Id::StageY(i), yd, h, dpi_max);
             self.y += h;
@@ -476,7 +491,7 @@ fn button_icon(id: Id, label: &str) -> Option<Icon> {
         Id::PairCancel | Id::Unpair => Icon::Stop,
         Id::CurveAdd => Icon::Add,
         Id::CurveRemove => Icon::Trash,
-        Id::None if label.starts_with("Scanning") => Icon::Refresh,
+        Id::None if label.starts_with("Scanning") || label.starts_with("正在扫描") => Icon::Refresh,
         _ => return None,
     })
 }
@@ -499,13 +514,13 @@ pub enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
-            Status::Done => "Done",
-            Status::Partial => "Partial",
-            Status::Todo => "Planned",
-            Status::Never => "No",
-            Status::Verified => "Verified",
-            Status::Testing => "Testing",
-            Status::ReadOnly => "Read-only",
+            Status::Done => "已完成",
+            Status::Partial => "部分支持",
+            Status::Todo => "计划中",
+            Status::Never => "不做",
+            Status::Verified => "已验证",
+            Status::Testing => "测试中",
+            Status::ReadOnly => "只读",
         }
     }
 
@@ -541,8 +556,8 @@ impl Status {
 
 pub fn build(ui: &Ui, f: &mut Form) {
     if let Some(e) = ui.config_error() {
-        f.section_icon("Config file problem", Some(Icon::Warning));
-        f.note(&format!("{e}. Showing defaults; fix the file or press \"Re-import from mouse\" in Settings."));
+        f.section_icon("配置文件异常", Some(Icon::Warning));
+        f.note(&format!("{e}。当前已回退显示默认设置；请修复配置文件，或在“软件设置”中点击“从鼠标重新导入”。"));
     }
     match ui.page {
         Page::Performance => performance(ui, f),
@@ -560,101 +575,113 @@ fn hz_labels(rates: &[u16]) -> Vec<String> {
     rates.iter().map(|r| format!("{r}")).collect()
 }
 
+fn mode_label_zh(m: Mode) -> &'static str {
+    match m {
+        Mode::Classic => "经典 (Classic)",
+        Mode::Natural => "自然 (Natural)",
+        Mode::Jump => "跃迁 (Jump)",
+        Mode::Custom => "自定义曲线",
+    }
+}
+
 fn performance(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
-    f.section_icon("Sensitivity", Some(Icon::Speed));
+    f.section_icon("灵敏度 (DPI)", Some(Icon::Speed));
     let staged = cfg.dpi.stages.len() > 1;
-    f.toggle("Enable DPI stages", "Cycle through them with the mouse's DPI button", staged, Id::StagesEnabled);
+    f.toggle("启用多档位 DPI", "可通过鼠标底部的 DPI 键在各档位之间循环切换", staged, Id::StagesEnabled);
     let xy = !cfg.dpi.y_stages.is_empty();
-    f.toggle("Independent X and Y", "Separate horizontal and vertical sensitivity", xy, Id::XySplit);
+    f.toggle("独立设置 X / Y 轴", "分别为水平（X）与垂直（Y）移动设置不同的 DPI 灵敏度", xy, Id::XySplit);
     let y_of = |i: usize| if xy { cfg.dpi.y_stages.get(i).copied() } else { None };
     if staged {
-        let counts: Vec<String> = (1..=5).map(|n| n.to_string()).collect();
-        f.chips("Number of stages", "", &counts, Some(cfg.dpi.stages.len() - 1), Id::StageCount);
+        let counts: Vec<String> = (1..=5).map(|n| format!("{n} 档")).collect();
+        f.chips("DPI 档位数量", "", &counts, Some(cfg.dpi.stages.len() - 1), Id::StageCount);
         f.gap(4);
         for (i, d) in cfg.dpi.stages.iter().enumerate() {
             f.stage(i, *d, y_of(i), cfg.dpi.active as usize == i + 1, true, ui.spec.dpi_max);
         }
-        f.note(&format!("Select the stage to use now. Range 100 to {} DPI in steps of 50; type an exact value in the box.", ui.spec.dpi_max));
+        f.note(&format!(
+            "点击左侧圆点切换当前生效档位。滑块范围 100 至 {} DPI（步进 50），也可在右侧输入框输入 1 DPI 精度的任意数值并按回车。",
+            ui.spec.dpi_max
+        ));
     } else {
         f.stage(0, cfg.dpi.stages[0], y_of(0), true, false, ui.spec.dpi_max);
-        f.note(&format!("Range 100 to {} DPI in steps of 50; type an exact value in the box.", ui.spec.dpi_max));
+        f.note(&format!("滑块范围 100 至 {} DPI（步进 50），也可在右侧输入框直接输入 1 DPI 精度的精确数值并按回车。", ui.spec.dpi_max));
     }
 
     if ui.spec.supports_acceleration {
-        f.section_icon("Dynamic Sensitivity", Some(Icon::Sliders));
+        f.section_icon("动态灵敏度 (板载鼠标加速)", Some(Icon::Sliders));
         let a = &cfg.acceleration;
-        f.toggle("Enable Dynamic Sensitivity", "The mouse scales its sensitivity with how fast you move it (stored onboard)", a.enabled, Id::AccelOn);
+        f.toggle("启用动态灵敏度", "根据手部移动速度实时缩放灵敏度倍率（完全存储于鼠标板载固件）", a.enabled, Id::AccelOn);
         if a.enabled {
             let mode = a.mode().unwrap_or(Mode::Classic);
-            let modes = [Mode::Classic, Mode::Natural, Mode::Jump, Mode::Custom].map(|m| m.label().to_string());
-            f.chips("Curve", "", &modes, Some(mode as usize), Id::AccelMode);
+            let modes = [Mode::Classic, Mode::Natural, Mode::Jump, Mode::Custom].map(|m| mode_label_zh(m).to_string());
+            f.chips("加速曲线模式", "", &modes, Some(mode as usize), Id::AccelMode);
             f.gap(4);
             if mode == Mode::Custom {
                 f.curve(&a.curve, true, ui.curve_sel);
                 let can_remove = a.curve.len() > 2 && ui.curve_sel.is_some_and(|i| i > 0);
                 let can_add = a.curve.len() < crate::accel::MAX_CONTROL_POINTS;
                 f.buttons(&[
-                    ("Add point", if can_add { Id::CurveAdd } else { Id::None }, false),
-                    ("Remove point", if can_remove { Id::CurveRemove } else { Id::None }, false),
-                    ("Start from Classic", Id::CurveTemplate(0), false),
-                    ("Natural", Id::CurveTemplate(1), false),
-                    ("Jump", Id::CurveTemplate(2), false),
+                    ("添加控制点", if can_add { Id::CurveAdd } else { Id::None }, false),
+                    ("删除选中点", if can_remove { Id::CurveRemove } else { Id::None }, false),
+                    ("套用经典模板", Id::CurveTemplate(0), false),
+                    ("自然模板", Id::CurveTemplate(1), false),
+                    ("跃迁模板", Id::CurveTemplate(2), false),
                 ]);
-                f.note("Drag the points: horizontal is the speed of the movement, vertical the sensitivity multiplier (0.1 to 1.5). The curve stays flat after the last point. Click a point, then \"Remove point\" to delete it.");
+                f.note("直接拖动图上的控制点调整曲线：横轴为移动速度，纵轴为灵敏度倍率（0.1 至 1.5x），最后一个点之后保持平直。");
             } else {
                 f.curve(&mode.template(), false, None);
-                f.note("Classic, Natural and Jump are built into the mouse's firmware; the plot shows Synapse's drawing of each. Pick Custom to shape your own curve.");
+                f.note("“经典 / 自然 / 跃迁”三条预设直接内置于鼠标固件中；选择“自定义曲线”可自由拖拽控制点写入板载曲线。");
             }
         }
     }
-    f.section_icon("Polling rate", Some(Icon::Bolt));
+    f.section_icon("轮询回报率 (Polling Rate)", Some(Icon::Bolt));
     let rates: &[u16] = ui.spec.polling_rates;
     let sel = rates.iter().position(|r| *r == cfg.polling.rate).unwrap_or(0);
     let sub = if rates.iter().any(|r| *r > 1000) {
-        "Reports per second. 4000 and 8000 need the HyperPolling dongle and use more battery"
+        "每秒向电脑汇报坐标的次数。4000 / 8000 Hz 延迟极低，但无线模式下耗电更快"
     } else {
-        "Reports per second"
+        "每秒向电脑汇报坐标的次数"
     };
-    f.ticks("Polling rate (Hz)", sub, &hz_labels(rates), sel, Id::Polling);
+    f.ticks("回报率 (Hz)", sub, &hz_labels(rates), sel, Id::Polling);
 
-    f.note("Games can switch to their own polling rate, DPI stage and buttons while they run: see the Games page.");
+    f.note("日常桌面推荐 500 或 1000 Hz 省电，可在“游戏配置”页面设置进入游戏时自动切换至 4000 / 8000 Hz。");
 
     if !ui.spec.lighting.is_empty() {
         lighting(ui, f);
     }
 
     if ui.spec.supports_rotation {
-        f.section_icon("Rotation", Some(Icon::Sync));
+        f.section_icon("传感器角度微调 (Rotation)", Some(Icon::Sync));
         let on = cfg.sensor.rotation != 0;
-        f.toggle("Enable rotation", "Compensate a tilted grip by rotating the sensor's axes", on, Id::RotationOn);
+        f.toggle("启用角度校准", "旋转传感器坐标轴以补偿斜握鼠标的发力习惯（板载生效）", on, Id::RotationOn);
         if on {
-            f.slider("Angle", "", -30, 30, 1, cfg.sensor.rotation as i32, |v| format!("{v}°"), Id::Rotation);
+            f.slider("旋转角度", "负值逆时针补偿，正值顺时针补偿", -30, 30, 1, cfg.sensor.rotation as i32, |v| format!("{v}°"), Id::Rotation);
         }
     }
 }
 
 /// Colour chips of the Lighting section: (label, rgb).
 pub const LIGHT_COLORS: [(&str, [u8; 3]); 8] = [
-    ("Red", [0xff, 0x00, 0x00]),
-    ("Orange", [0xff, 0x60, 0x00]),
-    ("Yellow", [0xff, 0xd0, 0x00]),
-    ("Green", [0x00, 0xff, 0x40]),
-    ("Cyan", [0x00, 0xd0, 0xff]),
-    ("Blue", [0x00, 0x30, 0xff]),
-    ("Purple", [0xa0, 0x00, 0xff]),
-    ("White", [0xff, 0xff, 0xff]),
+    ("红色", [0xff, 0x00, 0x00]),
+    ("橙色", [0xff, 0x60, 0x00]),
+    ("黄色", [0xff, 0xd0, 0x00]),
+    ("绿色", [0x00, 0xff, 0x40]),
+    ("青色", [0x00, 0xd0, 0xff]),
+    ("蓝色", [0x00, 0x30, 0xff]),
+    ("紫色", [0xa0, 0x00, 0xff]),
+    ("白色", [0xff, 0xff, 0xff]),
 ];
 
 fn lighting(ui: &Ui, f: &mut Form) {
     use crate::lighting::Effect;
     let cfg = &ui.cfg;
-    f.section_icon("Lighting", Some(Icon::Bolt));
-    let kinds: Vec<String> = ["Off", "Static", "Breathing", "Spectrum"].iter().map(|s| s.to_string()).collect();
+    f.section_icon("板载灯效", Some(Icon::Bolt));
+    let kinds: Vec<String> = ["关闭", "常亮", "呼吸", "光谱循环"].iter().map(|s| s.to_string()).collect();
     for (i, (zone, _)) in ui.spec.lighting.iter().enumerate() {
         let title = match *zone {
-            "logo" => "Logo",
-            "wheel" => "Scroll wheel",
+            "logo" => "Logo 灯",
+            "wheel" => "滚轮灯",
             z => z,
         };
         let e = cfg.lighting.zone(zone).and_then(|s| Effect::parse(s).ok());
@@ -664,12 +691,12 @@ fn lighting(ui: &Ui, f: &mut Form) {
             Effect::Breathing(_) | Effect::BreathingRandom => 2,
             Effect::Spectrum => 3,
         });
-        let sub = if e.is_none() { "Not set: the mouse keeps the effect it has" } else { "" };
+        let sub = if e.is_none() { "未指定：保持鼠标当前灯效" } else { "" };
         f.chips(title, sub, &kinds, sel, Id::LightEffect(i));
         if let Some(e @ (Effect::Static(_) | Effect::Breathing(_) | Effect::BreathingRandom)) = e {
             let mut colors: Vec<String> = LIGHT_COLORS.iter().map(|(l, _)| l.to_string()).collect();
             if !matches!(e, Effect::Static(_)) {
-                colors.push("Random".into());
+                colors.push("随机颜色".into());
             }
             let csel = match e {
                 Effect::BreathingRandom => Some(LIGHT_COLORS.len()),
@@ -679,15 +706,15 @@ fn lighting(ui: &Ui, f: &mut Form) {
         }
         f.gap(4);
     }
-    f.slider("Brightness", "Every zone", 0, 100, 5, cfg.lighting.brightness.unwrap_or(100) as i32, |v| format!("{v} %"), Id::Brightness);
-    f.note("Stored in the mouse, so the lights look the same on any computer. Other colours: set \"static:#rrggbb\" in the config's [lighting] table.");
+    f.slider("灯光亮度", "作用于全部灯区", 0, 100, 5, cfg.lighting.brightness.unwrap_or(100) as i32, |v| format!("{v} %"), Id::Brightness);
+    f.note("直接写入鼠标板载内存。如需任意色号，可在配置文件 [lighting] 下写入 \"static:#rrggbb\"。");
 }
 
 /// "1600 DPI  ·  2000 Hz" for a profile's tile.
 fn tile_summary(cfg: &crate::config::Config, g: &crate::config::GameConfig) -> String {
     let stage = match g.dpi_stage.and_then(|s| cfg.dpi.stages.get(s as usize - 1)) {
         Some(d) => format!("{d} DPI"),
-        None => "DPI kept".to_string(),
+        None => "保持当前 DPI".to_string(),
     };
     let polling = match g.polling {
         Some(p) => format!("{p} Hz"),
@@ -704,12 +731,12 @@ fn badge_of(source: Option<&str>) -> &'static str {
         Some("GOG") => "GOG",
         Some("Xbox") => "Xbox",
         Some("EA app") => "EA app",
-        Some("Battle.net") => "Battle.net",
+        Some("Battle.net") => "暴雪战网",
         Some("Riot") => "Riot",
-        Some("Ubisoft Connect") => "Ubisoft Connect",
+        Some("Ubisoft Connect") => "育碧",
         Some("Rockstar") => "Rockstar",
-        Some(_) => "Launcher",
-        None => "Program",
+        Some(_) => "启动器",
+        None => "本地程序",
     }
 }
 
@@ -717,11 +744,13 @@ fn games(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
     let rates: &[u16] = ui.spec.polling_rates;
 
-    f.section_icon("Game profiles", Some(Icon::Game));
+    f.section_icon("游戏专属配置", Some(Icon::Game));
     if cfg.games.is_empty() {
-        f.note("No game profiles yet. Click an installed game below, or add a program, to give it its own DPI stage, polling rate and buttons. The tray app switches the mouse to them while the game is in the foreground.");
+        f.note(
+            "尚未添加游戏配置。点击下方已安装游戏封面（或“添加程序”），即可为该游戏独立指定 DPI 档位、回报率与按键映射；托盘程序会在游戏处于前台时自动切换。",
+        );
     } else {
-        f.note("Click a profile to change it. The tray app applies it about two seconds after the game takes the foreground and restores your normal settings when you leave it.");
+        f.note("点击卡片展开设置。当游戏切到前台约 2 秒后，托盘程序会自动将对应配置写入鼠标，退出或切回桌面时自动恢复日常设置。");
     }
     let mut tiles: Vec<TileItem> = cfg
         .games
@@ -737,27 +766,29 @@ fn games(ui: &Ui, f: &mut Form) {
         })
         .collect();
     // The last tile adds any program (games outside a launcher).
-    tiles.push(TileItem { id: Id::GameBrowse, title: "Add a program".to_string(), sub: "Any .exe".to_string(), badge: "", art: TileArt::Add, selected: false });
+    tiles.push(TileItem {
+        id: Id::GameBrowse, title: "添加程序".to_string(), sub: "选择任意 .exe".to_string(), badge: "", art: TileArt::Add, selected: false
+    });
     f.tiles(tiles);
 
     if let Some(g) = cfg.games.get(ui.sel_game).filter(|_| ui.game_open) {
-        f.section_icon(&format!("Profile: {}", g.label()), Some(Icon::Sliders));
+        f.section_icon(&format!("配置详情：{}", g.label()), Some(Icon::Sliders));
         game_settings(ui, f, g, rates);
     }
 
-    f.section_icon("Installed games", Some(Icon::Folder));
+    f.section_icon("已安装的游戏", Some(Icon::Folder));
     let free = ui.games_without_profile();
     let sources = ui.library_sources();
     if ui.scanning && ui.library.is_empty() {
-        f.note("Looking for installed games...");
+        f.note("正在扫描本机已安装游戏...");
     } else if ui.library.is_empty() {
-        f.note("No games found in Steam, Epic Games, GOG, EA app, Battle.net, Riot, Ubisoft Connect, Rockstar or the Xbox app.");
+        f.note("未在 Steam、Epic、GOG、EA、战网、Riot、育碧、Rockstar 或 Xbox 中扫描到游戏，可点击上方“添加程序”手动选择 .exe。");
     } else {
-        f.note(&format!("{} games found. Click one to create its profile.", ui.library.len()));
+        f.note(&format!("共发现 {} 款已安装游戏，点击任意封面即可为其创建专属配置。", ui.library.len()));
     }
     // Filter chips per launcher (DESIGN.md 4.13), with counts, then the search box.
     if !sources.is_empty() {
-        let mut chips = vec![format!("All {}", ui.library.len())];
+        let mut chips = vec![format!("全部 {}", ui.library.len())];
         chips.extend(sources.iter().map(|s| format!("{s} {}", ui.library.iter().filter(|l| l.source == *s).count())));
         let sel = ui.lib_source.and_then(|s| sources.iter().position(|x| *x == s)).map(|i| i + 1).unwrap_or(0);
         f.chips_wide("", &chips, Some(sel), Id::GameSource);
@@ -778,122 +809,117 @@ fn games(ui: &Ui, f: &mut Form) {
     let none = shown.is_empty();
     f.tiles(shown);
     if none && (!filter.is_empty() || ui.lib_source.is_some()) {
-        f.note("No game matches the search.");
+        f.note("没有匹配筛选条件的游戏。");
     }
-    f.buttons(&[(if ui.scanning { "Scanning..." } else { "Scan again" }, if ui.scanning { Id::None } else { Id::GameScan }, false)]);
+    f.buttons(&[(if ui.scanning { "正在扫描..." } else { "重新扫描游戏库" }, if ui.scanning { Id::None } else { Id::GameScan }, false)]);
 
-    f.section_icon("In-game polling rate", Some(Icon::Bolt));
+    f.section_icon("游戏默认高回报率", Some(Icon::Bolt));
     let gsel = rates.iter().position(|r| *r == cfg.polling.game_rate).unwrap_or(0);
-    f.ticks("Rate while gaming (Hz)", "Used by game profiles set to \"In-game rate\"", &hz_labels(rates), gsel, Id::GameRate);
+    f.ticks("游戏运行时回报率 (Hz)", "供勾选“使用游戏默认回报率”的游戏配置自动调用", &hz_labels(rates), gsel, Id::GameRate);
     if !cfg.polling.games.is_empty() {
-        f.edit("More programs", "Executable names, comma separated: they get the in-game rate only", &cfg.polling.games.join(", "), false, Id::GamesEdit);
+        f.edit("额外进程列表", "逗号分隔的进程名（仅自动提升回报率）", &cfg.polling.games.join(", "), false, Id::GamesEdit);
     }
-    f.note("Like Synapse's in-game polling rate. Higher rates use more battery, so the rate only goes up while a game is in the foreground.");
+    f.note("日常桌面使用 500 / 1000 Hz 续航更久，仅当游戏处于前台时自动拉满至 4000 / 8000 Hz。");
 }
 
 /// The settings of the open game profile.
-fn game_settings(ui: &Ui, f: &mut Form, g: &crate::config::GameConfig, rates: &[u16]) {
-    let cfg = &ui.cfg;
-    let mut stages = vec!["Keep".to_string()];
-    stages.extend((1..=cfg.dpi.stages.len()).map(|i| format!("Stage {i} ({})", cfg.dpi.stages[i - 1])));
-    f.chips_wide("DPI stage while playing", &stages, Some(g.dpi_stage.map(|s| s as usize).filter(|s| *s <= cfg.dpi.stages.len()).unwrap_or(0)), Id::GameStage);
+fn game_settings(_ui: &Ui, f: &mut Form, g: &crate::config::GameConfig, rates: &[u16]) {
+    let cfg = &_ui.cfg;
+    let mut stages = vec!["保持日常档位".to_string()];
+    stages.extend((1..=cfg.dpi.stages.len()).map(|i| format!("档位 {i} ({})", cfg.dpi.stages[i - 1])));
+    f.chips_wide("游戏时使用的 DPI 档位", &stages, Some(g.dpi_stage.map(|s| s as usize).filter(|s| *s <= cfg.dpi.stages.len()).unwrap_or(0)), Id::GameStage);
     if cfg.dpi.stages.len() < 2 {
-        f.note("Only one DPI stage is set up. Enable DPI stages on the Performance page to give games their own sensitivity.");
+        f.note("当前仅开启了 1 个 DPI 档位。如需为游戏指定专属灵敏度，请先在“性能”页面开启多档位 DPI。");
     }
-    let mut polls = vec![format!("In-game rate ({})", cfg.polling.game_rate)];
+    let mut polls = vec![format!("游戏默认 ({} Hz)", cfg.polling.game_rate)];
     polls.extend(rates.iter().map(|r| format!("{r} Hz")));
     let psel = g.polling.and_then(|p| rates.iter().position(|r| *r == p)).map(|i| i + 1).unwrap_or(0);
-    f.chips_wide("Polling rate while playing", &polls, Some(psel), Id::GamePolling);
-    f.edit("Name", "Shown here and in the tray tooltip. Press Enter to save", &g.label(), false, Id::GameName);
-    let exe_sub =
-        if g.dir.is_empty() { "Executable name, e.g. cs2.exe. Press Enter to save" } else { "Optional: every program in the game's folder already counts" };
-    f.edit("Program", exe_sub, &g.exe, false, Id::GameExe);
+    f.chips_wide("游戏时使用的回报率", &polls, Some(psel), Id::GamePolling);
+    f.edit("显示名称", "显示在卡片与托盘提示中，按回车保存", &g.label(), false, Id::GameName);
+    let exe_sub = if g.dir.is_empty() {
+        "进程可执行文件名，如 cs2.exe，按回车保存"
+    } else {
+        "可选：留空则该安装目录下的任意进程均会自动匹配"
+    };
+    f.edit("可执行文件", exe_sub, &g.exe, false, Id::GameExe);
     if !g.dir.is_empty() {
-        f.info("Folder", &g.dir);
+        f.info("游戏目录", &g.dir);
     }
     let n = g.buttons.len();
     f.info(
-        "Buttons",
+        "按键映射",
         &if n == 0 {
-            "same as the Normal layout".to_string()
+            "与日常“标准层”保持一致".to_string()
         } else {
-            format!("{n} assignment{} of its own, the rest as in the Normal layout", if n == 1 { "" } else { "s" })
+            format!("已单独覆盖 {n} 个按键，其余按键继承“标准层”设置")
         },
     );
-    f.buttons(&[("Edit button layout", Id::GameButtons, true), ("Remove profile", Id::GameRemove, false)]);
+    f.buttons(&[("编辑此游戏的按键布局", Id::GameButtons, true), ("删除配置", Id::GameRemove, false)]);
 }
 
 fn calibration(ui: &Ui, f: &mut Form) {
     use crate::sensor::{ASYM_LAND_MIN, ASYM_LIFT_MAX, ASYM_LIFT_MIN};
     let s = &ui.cfg.sensor;
-    f.section_icon("Smart Tracking", Some(Icon::Track));
-    let modes = ["Smart Tracking", "Keep current"].map(String::from);
+    f.section_icon("Focus Pro 智能追踪校准", Some(Icon::Track));
+    let modes = ["自定义智能追踪", "保持鼠标当前设置"].map(String::from);
     let sel = if s.tracking == "smart" { Some(0) } else { Some(1) };
-    f.chips("Tracking", "The two lift-off modes Synapse offers for this mouse", &modes, sel, Id::TrackMode);
+    f.chips("抬起追踪模式", "与雷云 4 提供的 Focus Pro 传感器校准选项完全一致", &modes, sel, Id::TrackMode);
     if s.tracking != "smart" {
-        f.note("The mouse keeps whatever lift-off setting is stored in it. Pick Smart Tracking to set it from here.");
+        f.note("当前保持鼠标内部已存储的抬起/着陆设置不做改动；选择“自定义智能追踪”即可在此处调节。");
         return;
     }
-    f.toggle("Asymmetric cut-off", "Separate lift-off and landing levels instead of one distance", s.asymmetric, Id::Asym);
+    f.toggle("启用非对称抬起截断 (Asymmetric Cut-off)", "分别精细设定“抬起停止追踪高度”与“放下恢复追踪高度”（共 26 级）", s.asymmetric, Id::Asym);
     if s.asymmetric {
         f.slider(
-            "Lift-off",
-            "Tracking stops at this level (low to high)",
+            "抬起截断高度 (Lift-off)",
+            "鼠标抬离垫面达到此等级时停止追踪（2 至 26）",
             ASYM_LIFT_MIN as i32,
             ASYM_LIFT_MAX as i32,
             1,
             s.lift as i32,
-            |v| v.to_string(),
+            |v| format!("{v} 级"),
             Id::Lift,
         );
         f.slider(
-            "Landing",
-            "Tracking resumes at this level, below the lift-off",
+            "着陆恢复高度 (Landing)",
+            "鼠标落回垫面低于此等级时恢复追踪（须小于抬起等级）",
             ASYM_LAND_MIN as i32,
             (s.lift as i32 - 1).max(ASYM_LAND_MIN as i32),
             1,
             s.land as i32,
-            |v| v.to_string(),
+            |v| format!("{v} 级"),
             Id::Land,
         );
-        f.note("Same sliders as Synapse's Asymmetric Cut-off for this mouse (lift-off 2..26, landing 1..25, Synapse's defaults 13 / 12). The mouse accepts the values but cannot read them back, so they are rewritten on every apply.");
+        f.note("与雷云 4 的非对称截断滑块一致（抬起 2..26，着陆 1..25，雷云默认 13 / 12）。炼狱蝰蛇 V4 Pro 支持直接从板载寄存器回读这两个等级。");
     } else {
-        f.slider("Lift-off distance", "1 mm is the lowest the sensor supports", 1, 3, 1, s.lift as i32, |v| format!("{v} mm"), Id::Lift);
-        f.note("Smart Tracking lets the sensor adapt to the surface by itself. Synapse offers no surface calibration or mouse-mat presets for this mouse, so neither does freenapse.");
+        f.slider("对称抬起距离", "1 mm 为传感器支持的最低抬起高度", 1, 3, 1, s.lift as i32, |v| format!("{v} mm"), Id::Lift);
+        f.note("智能追踪会自动适配不同材质鼠标垫表面，保持一致的抬起停止距离，设置直接存储在鼠标板载内存中。");
     }
 }
 
 fn power(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
-    f.section_icon("Battery", Some(Icon::Battery));
+    f.section_icon("电池电量", Some(Icon::Battery));
     f.battery();
-    f.slider(
-        "Battery notification",
-        "The tray app pops a notification at this level",
-        5,
-        50,
-        1,
-        cfg.tray.notify_percent as i32,
-        |v| format!("{v} %"),
-        Id::NotifyPercent,
-    );
+    f.slider("低电量桌面提醒", "电量低于该百分比时由托盘图标弹出气泡通知", 5, 50, 1, cfg.tray.notify_percent as i32, |v| format!("{v} %"), Id::NotifyPercent);
+    f.toggle("开机静默自启到系统托盘", "登录 Windows 时无弹窗、无控制台直接后台驻留托盘（看电量、进游戏自动切高回报率）", ui.autostart, Id::Autostart);
 
-    f.section_icon("Power saving", Some(Icon::Power));
+    f.section_icon("无线休眠与节能", Some(Icon::Power));
     f.slider(
-        "Idle sleep",
-        "Sleep after this much inactivity (wakes on the first movement)",
+        "空闲自动休眠",
+        "静止无操作达到该时长后进入省电休眠（移动即刻唤醒）",
         1,
         15,
         1,
         (cfg.power.idle_seconds / 60) as i32,
-        |v| if v == 1 { "1 minute".to_string() } else { format!("{v} minutes") },
+        |v| format!("{v} 分钟"),
         Id::Idle,
     );
     // Same rule as Synapse: the firmware only honours low power mode at 1000 Hz or less.
     let lpm_ok = cfg.polling.rate <= 1000;
     f.slider_opt(
-        "Low power mode",
-        "When wireless, the mouse enters low power mode once the battery is below this level",
+        "低功耗模式阈值",
+        "无线模式下电量低于该比例时自动进入低功耗节能状态",
         5,
         100,
         5,
@@ -903,27 +929,90 @@ fn power(ui: &Ui, f: &mut Form) {
         lpm_ok,
     );
     if !lpm_ok {
-        f.warning("Low power mode is not supported at polling rates of 2000 Hz and above. Lower the polling rate to use it.");
+        f.warning("当前回报率为 2000 Hz 或更高时，鼠标固件将忽略低功耗模式阈值（需降至 1000 Hz 及以下生效）。");
     }
 
-    if ui.wireless && ui.spec.pairing {
-        f.section_icon("HyperPolling wireless dongle", Some(Icon::Wifi));
-        let leds = ["Battery status", "Polling rate", "Off"].map(String::from);
-        f.chips("Indicator LED", "What the light on the dongle shows", &leds, Some((cfg.dongle.led as usize).clamp(1, 3) - 1), Id::DongleLed);
+    if ui.wireless && ui.spec.dongle == DongleKind::Gen2Dome {
+        f.section_icon("HyperSpeed 二代半球形无线接收器（3 颗指示灯）", Some(Icon::Wifi));
+        let slot_labels: Vec<String> = DONGLE_LED_SLOTS.iter().map(|(_, _, l)| (*l).to_string()).collect();
+        let slot_titles = [
+            ("左指示灯", "接收器正面左侧第 1 颗 LED 显示内容（出厂默认：电量状态）"),
+            ("中指示灯", "接收器正面中间第 2 颗 LED 显示内容（出厂默认：连接状态）"),
+            ("右指示灯", "接收器正面右侧第 3 颗 LED 显示内容（出厂默认：回报率）"),
+        ];
+        let shown_leds = ui.shown_dongle_leds();
+        for (idx, (title, sub)) in slot_titles.iter().enumerate() {
+            let sel = shown_leds.and_then(|codes| DONGLE_LED_SLOTS.iter().position(|(c, _, _)| *c == codes[idx]));
+            f.chips(title, sub, &slot_labels, sel, Id::DongleLedSlot(idx));
+        }
+        let shown_br = ui.shown_dongle_bright().unwrap_or(4).min(4) as i32;
+        f.slider(
+            "接收器指示灯亮度",
+            "共 4 档亮度，拉到最左可一键熄灭全部 3 颗指示灯",
+            0,
+            4,
+            1,
+            shown_br,
+            |v| if v == 0 { "关闭".into() } else { format!("{} %", v * 25) },
+            Id::DongleLedBright,
+        );
+        f.note("直接写入二代半球形接收器固件（0x07/0x15 与 0x07/0x16），重启电脑或插到其他设备同样保持生效。");
+    } else if ui.wireless && ui.spec.dongle == DongleKind::HyperPolling {
+        f.section_icon("HyperPolling 无线接收器", Some(Icon::Wifi));
+        let leds = ["电量状态", "回报率", "关闭"].map(String::from);
+        f.chips("指示灯模式", "接收器指示灯展示的信息", &leds, Some((cfg.dongle.led as usize).clamp(1, 3) - 1), Id::DongleLed);
     }
 }
 
-pub const CATEGORIES: [&str; 11] = ["Default", "Mouse", "Keyboard", "DPI", "Multimedia", "System", "Macro", "Program", "Text", "Hypershift", "Disabled"];
+pub const CATEGORIES: [&str; 12] =
+    ["默认", "鼠标按键", "键盘按键", "DPI 切换", "多媒体", "桌面快捷", "系统与配置", "宏", "启动程序", "输入文本", "Hypershift", "禁用"];
 pub const CAT_MOUSE: usize = 1;
 pub const CAT_KEYBOARD: usize = 2;
-pub const CAT_SYSTEM: usize = 5;
-pub const CAT_MACRO: usize = 6;
+pub const CAT_DPI: usize = 3;
+pub const CAT_MEDIA: usize = 4;
+/// Common Windows & desktop shortcuts (Synapse 4 "Windows Shortcuts"), stored onboard as `key:...`.
+pub const CAT_SHORTCUT: usize = 5;
+pub const CAT_SYSTEM: usize = 6;
+pub const CAT_MACRO: usize = 7;
 /// Start a program: a one-step `launch:` macro played by the tray app.
-pub const CAT_LAUNCH: usize = 7;
+pub const CAT_LAUNCH: usize = 8;
 /// Type a text: a one-step `text:` macro played by the tray app.
-pub const CAT_TEXT: usize = 8;
-pub const CAT_HYPERSHIFT: usize = 9;
-pub const CAT_DISABLED: usize = 10;
+pub const CAT_TEXT: usize = 9;
+pub const CAT_HYPERSHIFT: usize = 10;
+pub const CAT_DISABLED: usize = 11;
+
+/// One-click Windows & desktop shortcuts matching Razer Synapse 4 ("Windows 快捷方式").
+/// Every entry uses canonical modifier order (`ctrl`, `shift`, `alt`, `win`) so onboard
+/// hardware readback (`spec_for`) matches 1:1.
+pub const SHORTCUT_PRESETS: [(&str, &str); 16] = [
+    ("显示桌面", "key:win+d"),
+    ("任务视图", "key:win+tab"),
+    ("切换窗口", "key:alt+tab"),
+    ("关闭窗口", "key:alt+f4"),
+    ("虚拟桌面左移", "key:ctrl+win+left"),
+    ("虚拟桌面右移", "key:ctrl+win+right"),
+    ("区域截图", "key:shift+win+s"),
+    ("资源管理器", "key:win+e"),
+    ("锁定电脑", "key:win+l"),
+    ("剪贴板历史", "key:win+v"),
+    ("任务管理器", "key:ctrl+shift+esc"),
+    ("浏览器后退", "key:alt+left"),
+    ("浏览器前进", "key:alt+right"),
+    ("复制", "key:ctrl+c"),
+    ("粘贴", "key:ctrl+v"),
+    ("撤销", "key:ctrl+z"),
+];
+
+/// Match a `key:...` spec against [`SHORTCUT_PRESETS`], normalizing modifier order
+/// so manual edits like `key:win+shift+s` also resolve to `("区域截图", "key:shift+win+s")`.
+pub fn shortcut_preset_of(spec: &str) -> Option<(&'static str, &'static str)> {
+    if !spec.starts_with("key:") {
+        return None;
+    }
+    let canon = parse_button(spec).ok().flatten().and_then(|f| crate::config::spec_for(&f));
+    let target = canon.as_deref().unwrap_or(spec);
+    SHORTCUT_PRESETS.iter().copied().find(|(_, s)| *s == target)
+}
 
 /// The single software step of a macro bound by the Program or Text function:
 /// (`launch` or `text`, its value), when the assignment is exactly that.
@@ -951,10 +1040,11 @@ pub fn category_of(spec: Option<&str>, macros_: &[MacroConfig]) -> usize {
     match spec {
         None | Some("default") => 0,
         Some(s) if s.starts_with("mouse:") || s.starts_with("turbo:") || s == "double-click" => CAT_MOUSE,
+        Some(s) if shortcut_preset_of(s).is_some() => CAT_SHORTCUT,
         Some(s) if s.starts_with("key:") || s.starts_with("turbo-key:") => CAT_KEYBOARD,
-        Some(s) if s.starts_with("dpi") || s.starts_with("clutch:") => 3,
+        Some(s) if s.starts_with("dpi") || s.starts_with("clutch:") => CAT_DPI,
         Some(s) if s.starts_with("profile-") => CAT_SYSTEM,
-        Some(s) if s.starts_with("media:") => 4,
+        Some(s) if s.starts_with("media:") => CAT_MEDIA,
         Some(s) if s.starts_with("system:") => CAT_SYSTEM,
         Some(s) if s.starts_with("macro") => CAT_MACRO,
         Some("hypershift") => CAT_HYPERSHIFT,
@@ -964,7 +1054,17 @@ pub fn category_of(spec: Option<&str>, macros_: &[MacroConfig]) -> usize {
 }
 
 /// Playback options in the order of the chips on the Customize page.
-pub const PLAYBACKS: [&str; 5] = ["Play once", "N times", "While held", "Toggle", "Sequence"];
+pub const PLAYBACKS: [&str; 5] = ["播放一次", "指定次数", "按住循环", "切换开关", "按步顺序"];
+
+fn playback_label_zh(p: Playback) -> String {
+    match p {
+        Playback::Times(1) => "单次".into(),
+        Playback::Times(n) => format!("{n} 次"),
+        Playback::Held => "按住循环".into(),
+        Playback::Toggle => "切换开关".into(),
+        Playback::Sequence => "步进序列".into(),
+    }
+}
 
 pub fn playback_index(p: Playback) -> usize {
     match p {
@@ -1007,37 +1107,38 @@ pub fn options_for(cat: usize, stages: usize) -> Vec<(String, String)> {
     match cat {
         CAT_MOUSE => {
             let mut v: Vec<(String, String)> = CLICK_CODES.iter().map(|(n, _)| (pretty_button(n), format!("mouse:{n}"))).collect();
-            v.push(("Double click".to_string(), "double-click".to_string()));
+            v.push(("左键双击".to_string(), "double-click".to_string()));
             v
         }
+        CAT_SHORTCUT => SHORTCUT_PRESETS.iter().map(|(l, s)| (l.to_string(), s.to_string())).collect(),
         CAT_SYSTEM => {
             let mut v: Vec<(String, String)> =
-                [("Sleep", "sleep"), ("Power", "power"), ("Wake", "wake")].iter().map(|(l, s)| (l.to_string(), format!("system:{s}"))).collect();
-            v.push(("Profile cycle up".to_string(), "profile-cycle-up".to_string()));
-            v.push(("Profile cycle down".to_string(), "profile-cycle-down".to_string()));
+                [("系统睡眠", "sleep"), ("系统关机/电源", "power"), ("系统唤醒", "wake")].iter().map(|(l, s)| (l.to_string(), format!("system:{s}"))).collect();
+            v.push(("配置文件向上循环".to_string(), "profile-cycle-up".to_string()));
+            v.push(("配置文件向下循环".to_string(), "profile-cycle-down".to_string()));
             v
         }
-        3 => {
+        CAT_DPI => {
             let mut v = vec![
-                ("Cycle stages".to_string(), "dpi-cycle".to_string()),
-                ("Cycle up".to_string(), "dpi-up".to_string()),
-                ("Cycle down".to_string(), "dpi-down".to_string()),
+                ("DPI 循环切换".to_string(), "dpi-cycle".to_string()),
+                ("DPI 升高一档".to_string(), "dpi-up".to_string()),
+                ("DPI 降低一档".to_string(), "dpi-down".to_string()),
             ];
             for i in 1..=stages.clamp(1, 5) {
-                v.push((format!("Stage {i}"), format!("dpi-stage:{i}")));
+                v.push((format!("锁定档位 {i}"), format!("dpi-stage:{i}")));
             }
-            v.push(("Clutch 400 DPI".to_string(), "clutch:400".to_string()));
-            v.push(("Clutch 800 DPI".to_string(), "clutch:800".to_string()));
+            v.push(("狙击键 (按住 400 DPI)".to_string(), "clutch:400".to_string()));
+            v.push(("狙击键 (按住 800 DPI)".to_string(), "clutch:800".to_string()));
             v
         }
-        4 => [
-            ("Play / Pause", "play-pause"),
-            ("Mute", "mute"),
-            ("Volume up", "vol-up"),
-            ("Volume down", "vol-down"),
-            ("Next track", "next"),
-            ("Previous track", "prev"),
-            ("Stop", "stop"),
+        CAT_MEDIA => [
+            ("播放 / 暂停", "play-pause"),
+            ("静音", "mute"),
+            ("音量 +", "vol-up"),
+            ("音量 -", "vol-down"),
+            ("下一曲", "next"),
+            ("上一曲", "prev"),
+            ("停止播放", "stop"),
         ]
         .iter()
         .map(|(l, s)| (l.to_string(), format!("media:{s}")))
@@ -1046,23 +1147,39 @@ pub fn options_for(cat: usize, stages: usize) -> Vec<(String, String)> {
     }
 }
 
+fn pretty_combo(combo: &str) -> String {
+    combo
+        .split('+')
+        .map(|p| {
+            let p = p.trim();
+            if p.len() == 1 {
+                p.to_uppercase()
+            } else {
+                let mut c = p.chars();
+                c.next().map(|x| x.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 fn pretty_button(name: &str) -> String {
     match name {
-        "left" => "Left click",
-        "right" => "Right click",
-        "middle" => "Middle click",
-        "back" => "Back",
-        "forward" => "Forward",
-        "scroll-up" => "Scroll up",
-        "scroll-down" => "Scroll down",
-        "dpi" => "DPI button",
-        "dpi-up" => "DPI up",
-        "dpi-down" => "DPI down",
-        "tilt-left" => "Wheel tilt left",
-        "tilt-right" => "Wheel tilt right",
-        "clutch" => "Sensitivity clutch",
-        "profile" => "Profile button",
-        "scroll-mode" => "Scroll mode button",
+        "left" => "左键",
+        "right" => "右键",
+        "middle" => "中键 (滚轮按下)",
+        "back" => "后退侧键",
+        "forward" => "前进侧键",
+        "scroll-up" => "滚轮上滚",
+        "scroll-down" => "滚轮下滚",
+        "dpi" => "底部电源 / DPI 键",
+        "dpi-up" => "DPI + 键",
+        "dpi-down" => "DPI - 键",
+        "tilt-left" => "滚轮左倾",
+        "tilt-right" => "滚轮右倾",
+        "clutch" => "灵敏度离合键 (狙击键)",
+        "profile" => "配置文件切换键",
+        "scroll-mode" => "滚轮模式切换键",
         other => other,
     }
     .to_string()
@@ -1077,9 +1194,9 @@ fn default_label(own: &str, buttons: &[PhysicalButton], macros_: &[MacroConfig])
     match (crate::config::spec_for(&b.default), b.default.0) {
         (Some(spec), _) => pretty_spec(Some(&spec), own, buttons, macros_),
         // Functions the config has no value for (the Basilisk V3's scroll-mode button and tilts).
-        (None, [0x12, ..]) => "Scroll mode".into(),
-        (None, [0x0e, _, 0x68, ..]) => "Scroll left".into(),
-        (None, [0x0e, _, 0x69, ..]) => "Scroll right".into(),
+        (None, [0x12, ..]) => "滚轮模式切换".into(),
+        (None, [0x0e, _, 0x68, ..]) => "向左滚动".into(),
+        (None, [0x0e, _, 0x69, ..]) => "向右滚动".into(),
         (None, _) => pretty_button(own),
     }
 }
@@ -1089,61 +1206,51 @@ pub fn pretty_spec(spec: Option<&str>, own: &str, buttons: &[PhysicalButton], ma
     if let Some(s) = spec {
         let (base, rate) = turbo_split(s);
         if let Some(n) = rate {
-            return format!("{} · turbo {n}/s", pretty_spec(Some(&base), own, buttons, macros_));
+            return format!("{} · 连发 {n} 次/秒", pretty_spec(Some(&base), own, buttons, macros_));
         }
         match software_step(spec, macros_) {
-            Some(("launch", p)) => return format!("Program: {}", macros::launch_label(&p)),
-            Some(("text", t)) => return format!("Text: {t}"),
+            Some(("launch", p)) => return format!("启动程序：{}", macros::launch_label(&p)),
+            Some(("text", t)) => return format!("输入文本：{t}"),
             _ => {}
         }
         if let Some((id, play)) = parse_button(s).ok().flatten().and_then(|f| f.macro_binding()) {
-            let name = macros_.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| format!("macro {id}"));
-            return format!("Macro: {name} ({})", play.label().to_lowercase());
+            let name = macros_.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| format!("宏 {id}"));
+            return format!("宏：{name}（{}）", playback_label_zh(play));
         }
     }
     match spec {
-        None | Some("default") => format!("{} (default)", default_label(own, buttons, macros_)),
-        Some("disabled") => "Disabled".into(),
-        Some("hypershift") => "Hypershift".into(),
-        Some("double-click") => "Double click".into(),
-        Some("system:sleep") => "Sleep".into(),
-        Some("system:power") => "Power".into(),
-        Some("system:wake") => "Wake".into(),
-        Some("dpi-cycle") => "DPI cycle".into(),
-        Some("dpi-up") => "DPI cycle up".into(),
-        Some("dpi-down") => "DPI cycle down".into(),
-        Some(s) if s.starts_with("dpi-stage:") => format!("DPI stage {}", &s[10..]),
-        Some(s) if s.starts_with("clutch:") => format!("Sensitivity clutch {} DPI", s[7..].replace(':', " x ")),
-        Some("profile-next") => "Next profile".into(),
-        Some("profile-prev") => "Previous profile".into(),
-        Some("profile-cycle-up") => "Profile cycle up".into(),
-        Some("profile-cycle-down") => "Profile cycle down".into(),
+        None | Some("default") => format!("{} (默认)", default_label(own, buttons, macros_)),
+        Some("disabled") => "已禁用".into(),
+        Some("hypershift") => "Hypershift 组合层键".into(),
+        Some("double-click") => "左键双击".into(),
+        Some("system:sleep") => "系统睡眠".into(),
+        Some("system:power") => "系统关机/电源".into(),
+        Some("system:wake") => "系统唤醒".into(),
+        Some("dpi-cycle") => "DPI 循环切换".into(),
+        Some("dpi-up") => "DPI 升高一档".into(),
+        Some("dpi-down") => "DPI 降低一档".into(),
+        Some(s) if s.starts_with("dpi-stage:") => format!("锁定 DPI 档位 {}", &s[10..]),
+        Some(s) if s.starts_with("clutch:") => format!("灵敏度离合 {} DPI", s[7..].replace(':', " x ")),
+        Some("profile-next") => "下一板载配置".into(),
+        Some("profile-prev") => "上一板载配置".into(),
+        Some("profile-cycle-up") => "配置文件向上循环".into(),
+        Some("profile-cycle-down") => "配置文件向下循环".into(),
         Some(s) if s.starts_with("mouse:") => pretty_button(&s[6..]),
-        Some(s) if s.starts_with("media:") => options_for(4, 1).iter().find(|(_, v)| v == s).map(|(l, _)| l.clone()).unwrap_or_else(|| s.to_string()),
-        Some("key:") => "Keyboard: type a key".into(),
-        Some(s) if s.starts_with("key:") => {
-            let parts: Vec<String> = s[4..]
-                .split('+')
-                .map(|p| {
-                    let p = p.trim();
-                    if p.len() == 1 {
-                        p.to_uppercase()
-                    } else {
-                        let mut c = p.chars();
-                        c.next().map(|x| x.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
-                    }
-                })
-                .collect();
-            format!("Key: {}", parts.join(" + "))
+        Some(s) if s.starts_with("media:") => options_for(CAT_MEDIA, 1).iter().find(|(_, v)| v == s).map(|(l, _)| l.clone()).unwrap_or_else(|| s.to_string()),
+        Some("key:") => "键盘按键：请输入键名".into(),
+        Some(s) if shortcut_preset_of(s).is_some() => {
+            let (label, canon) = shortcut_preset_of(s).unwrap();
+            format!("快捷：{label} ({})", pretty_combo(&canon[4..]))
         }
+        Some(s) if s.starts_with("key:") => format!("键盘：{}", pretty_combo(&s[4..])),
         Some(s) => s.to_string(),
     }
 }
 
 fn customize(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
-    f.section_icon("Button assignment", Some(Icon::Mouse));
-    let mut layers = vec!["Normal".to_string(), "Hypershift".to_string()];
+    f.section_icon("按键映射 (8 个可编程按键)", Some(Icon::Mouse));
+    let mut layers = vec!["标准层".to_string(), "Hypershift 第二层".to_string()];
     layers.extend(cfg.games.iter().map(|g| {
         let l = g.label();
         if l.chars().count() > 20 { format!("{}...", l.chars().take(18).collect::<String>().trim_end()) } else { l }
@@ -1153,7 +1260,7 @@ fn customize(ui: &Ui, f: &mut Form) {
         Layer::Hypershift => 1,
         Layer::Game(i) => 2 + i.min(cfg.games.len().saturating_sub(1)),
     };
-    f.chips_wide("Layer", &layers, Some(layer_sel), Id::Layer);
+    f.chips_wide("编辑按键层", &layers, Some(layer_sel), Id::Layer);
     f.gap(2);
 
     // Left: list of the physical buttons. Right: the mouse with clickable areas.
@@ -1176,12 +1283,12 @@ fn customize(ui: &Ui, f: &mut Form) {
         }
         let mut sub = pretty_spec(spec, name, buttons, &cfg.macros);
         if inherited {
-            sub.push_str(" · from Normal");
+            sub.push_str(" · 继承自标准层");
         }
         f.push(Id::SelectButton(i), f.x + PAD, f.y, list_w, row_h - 4, Kind::Row { title: pretty_button(name), sub, selected: ui.sel().name == name });
         f.y += row_h;
     }
-    let art_h = (row_h * buttons.len() as i32 - 4).min(row_h * 7 - 4);
+    let art_h = (row_h * buttons.len() as i32 - 4).min(row_h * 8 - 4);
     let art_x = f.x + PAD + list_w + 24;
     let art_w = f.w - 2 * PAD - list_w - 24;
     let regions = mouse_regions(f, art_x, y0, art_w, art_h, buttons);
@@ -1189,12 +1296,12 @@ fn customize(ui: &Ui, f: &mut Form) {
     f.push(Id::SelectButton(sel), art_x, y0, art_w, art_h, Kind::MouseArt { highlight: sel, regions });
     if hs && !cfg.buttons.values().any(|v| v == "hypershift") {
         f.gap(6);
-        f.note("No button is assigned to Hypershift yet, so this layer cannot be reached. Assign Hypershift to a button in the normal layer first.");
+        f.note("提示：标准层中尚未将任何按键指定为“Hypershift”，请先在标准层将一个按键设为 Hypershift，按住它时才能触发本层按键。");
     }
     if let Layer::Game(i) = ui.layer {
         f.gap(6);
         let exe = cfg.games.get(i).map(|g| g.label()).unwrap_or_else(|| "?".into());
-        f.note(&format!("Layout used while {exe} is in the foreground: the tray app writes it to the mouse when the game starts and restores the Normal layout when it ends. Buttons set to Default keep their Normal assignment."));
+        f.note(&format!("当前编辑《{exe}》前台运行时的专属按键：保持为“默认”的按键将继续沿用标准层设置，退出游戏后自动恢复。"));
     }
 
     let name = ui.sel().name;
@@ -1210,96 +1317,115 @@ fn customize(ui: &Ui, f: &mut Form) {
     let (base, rate) = spec.map(turbo_split).unwrap_or((String::new(), None));
     let layer_title = match ui.layer {
         Layer::Normal => String::new(),
-        Layer::Hypershift => " (Hypershift)".to_string(),
-        Layer::Game(i) => format!(" ({})", cfg.games.get(i).map(|g| g.label()).unwrap_or_default()),
+        Layer::Hypershift => "（Hypershift 第二层）".to_string(),
+        Layer::Game(i) => format!("（{}）", cfg.games.get(i).map(|g| g.label()).unwrap_or_default()),
     };
-    f.section_icon(&format!("Assign {}{layer_title}", pretty_button(name)), Some(Icon::Edit));
+    f.section_icon(&format!("分配功能：{}{layer_title}", pretty_button(name)), Some(Icon::Edit));
     let cats = CATEGORIES.map(String::from);
-    f.chips_wide("Function", &cats, Some(cat), Id::Category(0));
+    f.chips_wide("功能类别", &cats, Some(cat), Id::Category(0));
     match cat {
-        CAT_MOUSE | 3 | 4 | CAT_SYSTEM => {
+        CAT_MOUSE | CAT_DPI | CAT_MEDIA | CAT_SHORTCUT | CAT_SYSTEM => {
             let opts = options_for(cat, cfg.dpi.stages.len());
             let labels: Vec<String> = opts.iter().map(|(l, _)| l.clone()).collect();
-            let sel = opts.iter().position(|(_, s)| *s == base);
+            let canon_base = if cat == CAT_SHORTCUT { shortcut_preset_of(&base).map(|(_, s)| s).unwrap_or(base.as_str()) } else { base.as_str() };
+            let sel = opts.iter().position(|(_, s)| s == canon_base);
             f.chips_wide("", &labels, sel, Id::Option(0));
             if cat == CAT_MOUSE && base.starts_with("mouse:") {
                 turbo_controls(f, rate);
             }
+            if cat == CAT_SHORTCUT {
+                f.note("直接写入鼠标板载内存（硬件级发送系统组合键）：无需保持后台软件运行，彻底退出程序或插到其他电脑同样永久生效。");
+            }
             if cat == CAT_SYSTEM {
-                f.note("Sleep, Power and Wake send the system's power keys, like the keys on some keyboards. Windows decides what happens (sleep, shut down, wake).");
+                f.note("睡眠、关机与唤醒会发送标准系统电源键指令，具体行为由 Windows 系统电源选项决定。");
             }
         }
         CAT_KEYBOARD => {
             let cur = base.strip_prefix("key:").unwrap_or("");
-            f.edit("Key combination", "Press Enter to save", cur, false, Id::KeyEdit);
+            f.edit("键盘按键或组合键", "输入后按 Enter 回车键保存", cur, false, Id::KeyEdit);
             if base.starts_with("key:") {
                 turbo_controls(f, rate);
             }
-            f.note("Names: a-z, 0-9, f1-f24, enter, esc, tab, space, backspace, delete, home, end, pageup, pagedown, up, down, left, right, and the punctuation keys. Modifiers: ctrl, shift, alt, win, e.g. ctrl+shift+c.");
+            f.note("支持键名：a-z、0-9、f1-f24、enter、esc、tab、space、backspace、delete、home、end、pageup、pagedown、up、down、left、right 及标点键。修饰键支持 ctrl、shift、alt、win，例如 ctrl+shift+c 或 win+d。");
         }
         CAT_MACRO => {
             let bound = spec.and_then(|s| parse_button(s).ok().flatten()).and_then(|f| f.macro_binding());
             let names: Vec<String> = cfg.macros.iter().map(|m| m.name.clone()).collect();
             let sel = bound.and_then(|(id, _)| cfg.macros.iter().position(|m| m.id == id));
-            f.chips_wide("Macro", &names, sel, Id::Option(0));
+            f.chips_wide("选择要绑定的宏", &names, sel, Id::Option(0));
             let play = bound.map(|(_, p)| p).unwrap_or(Playback::Times(1));
-            f.chips_wide("Playback", &PLAYBACKS.map(String::from), Some(playback_index(play)), Id::MacroPlay);
+            f.chips_wide("播放方式", &PLAYBACKS.map(String::from), Some(playback_index(play)), Id::MacroPlay);
             if let Playback::Times(n) = play {
                 if n > 1 {
-                    f.slider("Repeat count", "", 2, macros::TIMES_MAX as i32, 1, n as i32, |v| format!("{v} x"), Id::MacroTimes);
+                    f.slider("重复播放次数", "", 2, macros::TIMES_MAX as i32, 1, n as i32, |v| format!("{v} 次"), Id::MacroTimes);
                 }
             }
-            if ui.macro_onboard == Some(true) {
-                f.note("The macro plays from the mouse's own memory, so it works without any software. While held repeats it until the button is released; Toggle starts and stops it; Sequence plays one step per press.");
+            if cfg.tray.onboard_only {
+                f.warning("当前已开启“纯板载反作弊模式”，软件宏触发与 SendInput 播放已停用（可在“软件设置”或托盘菜单中关闭）。");
+            } else if ui.macro_onboard == Some(true) {
+                f.note("该鼠标内置板载宏存储，宏无需后台软件即可脱机运行。");
             } else {
-                f.note("This mouse has no macro memory, so the tray app plays the macro when the button is pressed (Synapse does the same for such a mouse): keep the tray running. The button sends one of the keys F13 to F24, which the tray turns into the macro. While held repeats it until the button is released; Toggle starts and stops it; Sequence plays one step per press.");
+                f.note("炼狱蝰蛇 V4 Pro 无硬件宏闪存（与雷云 4 机制一致）：按键在鼠标内绑定为 F13..F24 触发键，按下时由轻量托盘程序拦截并执行宏，请保持托盘图标运行。");
             }
         }
         CAT_LAUNCH => {
-            match software_step(spec, &cfg.macros) {
-                Some((_, p)) => f.note(&format!("Starts {p} when the button is pressed. Click Program again to choose another one.")),
-                None => f.note("Choose the program in the dialog. The button then starts it, or opens the file, when pressed."),
+            if cfg.tray.onboard_only {
+                f.warning("当前已开启“纯板载反作弊模式”，软件启动程序绑定已停用。");
             }
-            f.note("The tray app does the starting (the mouse sends one of the keys F13 to F24, which the tray turns into the launch), so keep it running. Windows shortcuts need no program: assign them as Keyboard keys, e.g. win+d.");
+            match software_step(spec, &cfg.macros) {
+                Some((_, p)) => f.note(&format!("按下此键将启动：{p}。再次点击上方“启动程序”可重新选择。")),
+                None => f.note("在弹出的窗口中选择要启动的程序或文件。"),
+            }
+            f.note("启动程序由后台托盘响应执行（请保持托盘运行）。如仅需系统快捷键（如显示桌面），直接选“桌面快捷”或“键盘按键”即可板载脱机使用。");
         }
         CAT_TEXT => {
+            if cfg.tray.onboard_only {
+                f.warning("当前已开启“纯板载反作弊模式”，软件文本输入已停用。");
+            }
             let cur = software_step(spec, &cfg.macros).filter(|(k, _)| *k == "text").map(|(_, t)| t).unwrap_or_default();
-            f.edit("Text to type", "Press Enter to save", &cur, false, Id::TextEdit);
-            f.note("The tray app types the text when the button is pressed, as Unicode characters, so any keyboard layout and any character work. Keep the tray running.");
+            f.edit("要自动输入的文本", "输入后按 Enter 回车键保存", &cur, false, Id::TextEdit);
+            f.note("按下按键时由托盘程序通过 Unicode 直接输入任意中英文文本（不受当前输入法状态影响），请保持托盘运行。");
         }
-        CAT_HYPERSHIFT => f.note("While this button is held, the Hypershift layer is active: all other buttons use their Hypershift assignment."),
-        CAT_DISABLED => f.note("The button does nothing."),
-        _ => f.note("The button's own function. Assignments are stored in the mouse (onboard profile 1), so they work without any software running."),
+        CAT_HYPERSHIFT => f.note("按住此键不放时激活 Hypershift 第二层：其他所有按键将临时切换为第二层功能。"),
+        CAT_DISABLED => f.note("禁用此物理按键（按下无任何响应；底部电源键长按 3 秒仍可正常开关机）。"),
+        _ => f.note("恢复该按键的出厂默认功能。普通按键、组合键、多媒体键与 DPI 切换均直写鼠标板载内存，无需后台软件即可在任何电脑上生效。"),
     }
 
     macros_section(ui, f);
 }
 
+/// Truncate a macro summary at a valid UTF-8 character boundary so multi-byte
+/// Chinese text macros never panic inside `String::truncate`.
+pub fn truncate_summary(mut sub: String, max_bytes: usize) -> String {
+    if sub.len() > max_bytes {
+        let end = macros::utf8_prefix(&sub, max_bytes.saturating_sub(3));
+        sub.truncate(end);
+        sub.push_str("...");
+    }
+    sub
+}
+
 /// The macro list with the recorder.
 fn macros_section(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
-    f.section_icon("Macros", Some(Icon::Keyboard));
+    f.section_icon("宏录制与管理", Some(Icon::Keyboard));
     if ui.is_recording() {
         f.note(&format!(
-            "Recording for {} s: {} events so far. Press keys and mouse buttons (the delays between them are recorded too), then click Stop or press Esc.",
+            "正在录制（已进行 {} 秒，记录 {} 个动作）：请按下键盘或鼠标按键（按键间隔延迟会一并记录），完成后点击“停止录制”或按 Esc。",
             ui.rec_secs, ui.rec_count
         ));
-        f.buttons(&[("Stop recording", Id::MacroStop, true)]);
+        f.buttons(&[("停止录制", Id::MacroStop, true)]);
         return;
     }
     if cfg.macros.is_empty() {
-        f.note("No macros yet. Record one: every key and mouse button you press, with the pauses between them, is saved and can be bound to a button above.");
+        f.note("暂无宏。点击下方“录制新宏”，你按下的键盘按键、鼠标点击及停顿间隔都会被记录，随后可绑定到上方任意鼠标按键。");
     }
     for (i, m) in cfg.macros.iter().enumerate() {
         let events = m.events().unwrap_or_default();
         let bytes = macros::encode(&events).len();
-        let mut sub = macros::describe(&events);
-        if sub.len() > 70 {
-            sub.truncate(67);
-            sub.push_str("...");
-        }
+        let mut sub = truncate_summary(macros::describe(&events), 70);
         if sub.is_empty() {
-            sub = "empty".into();
+            sub = "空宏".into();
         }
         f.push(
             Id::SelectMacro(i),
@@ -1307,147 +1433,179 @@ fn macros_section(ui: &Ui, f: &mut Form) {
             f.y,
             f.w - 2 * PAD,
             44,
-            Kind::Row { title: format!("{}  ·  id {}  ·  {} bytes", m.name, m.id, bytes), sub, selected: ui.sel_macro == Some(i) },
+            Kind::Row { title: format!("{}  ·  编号 {}  ·  {} 字节", m.name, m.id, bytes), sub, selected: ui.sel_macro == Some(i) },
         );
         f.y += 48;
     }
     f.gap(4);
     let has_sel = ui.sel_macro.is_some_and(|i| i < cfg.macros.len());
     f.buttons(&[
-        ("Record new macro", Id::MacroNew, true),
-        ("Record again", if has_sel { Id::MacroRecord } else { Id::None }, false),
-        ("Delete", if has_sel { Id::MacroDelete } else { Id::None }, false),
+        ("录制新宏", Id::MacroNew, true),
+        ("重新录制选中宏", if has_sel { Id::MacroRecord } else { Id::None }, false),
+        ("删除宏", if has_sel { Id::MacroDelete } else { Id::None }, false),
     ]);
     if let Some(m) = ui.sel_macro.and_then(|i| cfg.macros.get(i)) {
-        f.edit("Name", "Press Enter to save", &m.name, false, Id::MacroName);
+        f.edit("宏名称", "修改后按 Enter 回车键保存", &m.name, false, Id::MacroName);
         let steps = m.events.join(", ");
-        f.note(&format!("Steps: {steps}"));
+        f.note(&format!("动作序列：{steps}"));
     }
     match (ui.macro_onboard, ui.macro_storage) {
-        (Some(true), Some(st)) => f.note(&format!("Macro memory in the mouse: {} of {} bytes free. Steps can also be edited in the config file ([[macros]]).", st.available, st.total)),
-        (Some(false), _) => f.note(&format!("This mouse has no macro memory, so macros are played by the tray app (like Synapse does for it); up to {} different bindings. Steps can also be edited in the config file ([[macros]]).", macros::MAX_SOFT_SLOTS)),
-        _ => f.note("Steps can also be edited in the config file ([[macros]])."),
+        (Some(true), Some(st)) => {
+            f.note(&format!("鼠标板载宏空间：剩余 {} / {} 字节。也可在配置文件 [[macros]] 中手动精确编辑延迟毫秒。", st.available, st.total))
+        }
+        (Some(false), _) => f.note(&format!(
+            "当前鼠标无硬件宏闪存，宏由后台托盘低延迟播放（最多支持同时绑定 {} 组不同宏），也可在配置文件 [[macros]] 中精确编辑毫秒延迟。",
+            macros::MAX_SOFT_SLOTS
+        )),
+        _ => f.note("也可在配置文件 [[macros]] 中精确编辑每个步骤与延迟毫秒。"),
     }
 }
 
 /// Turbo toggle and rate slider under a mouse or keyboard assignment.
 fn turbo_controls(f: &mut Form, rate: Option<u8>) {
-    f.toggle("Turbo", "Repeat the function while the button is held", rate.is_some(), Id::Turbo);
+    f.toggle("启用连发 (Turbo)", "按住该按键时自动高频重复触发", rate.is_some(), Id::Turbo);
     if let Some(n) = rate {
-        f.slider("Repeat rate", "", TURBO_MIN as i32, TURBO_MAX as i32, 1, n as i32, |v| format!("{v} / s"), Id::TurboRate);
+        f.slider("每秒触发次数", "", TURBO_MIN as i32, TURBO_MAX as i32, 1, n as i32, |v| format!("{v} 次/秒"), Id::TurboRate);
     }
 }
 
 fn app(ui: &Ui, f: &mut Form) {
     let cfg = &ui.cfg;
-    f.section_icon("Tray app", Some(Icon::Program));
-    f.toggle("Start at login", "Run the tray app (battery icon, in-game polling) when you sign in", ui.autostart, Id::Autostart);
+    f.section_icon("系统托盘与开机静默自启", Some(Icon::Program));
+    f.toggle(
+        "开机静默自启到系统托盘",
+        "登录 Windows 时无弹窗、无控制台直接后台驻留托盘（状态栏电量图标、游戏自动切回报率、软件宏播放；若移动了 exe 位置会自动修复路径）",
+        ui.autostart,
+        Id::Autostart,
+    );
+    f.toggle(
+        "纯板载反作弊模式（禁用软件模拟输入）",
+        "彻底禁止挂载 WH_KEYBOARD_LL 键盘钩子与 SendInput 宏播放；纯板载改键、DPI、8K 回报率与进游戏自动切配置照常运行",
+        cfg.tray.onboard_only,
+        Id::OnboardOnly,
+    );
     f.slider(
-        "Battery refresh",
-        "How often the tray icon reads the battery while you use the mouse",
+        "电量刷新间隔",
+        "使用鼠标期间托盘读取电量的频率（鼠标休眠时绝不唤醒耗电）",
         10,
         300,
         10,
         cfg.tray.poll_seconds as i32,
-        |v| format!("{v} s"),
+        |v| format!("{v} 秒"),
         Id::PollSeconds,
     );
     f.gap(4);
     f.buttons(&[
-        ("Open config file", Id::OpenConfig, false),
-        ("Re-import from mouse", Id::Reimport, false),
-        ("Re-apply everything", Id::Reapply, false),
-        ("Refresh", Id::Refresh, false),
+        ("打开配置文件", Id::OpenConfig, false),
+        ("从鼠标重新导入", Id::Reimport, false),
+        ("重新写入全部设置", Id::Reapply, false),
+        ("立即刷新状态", Id::Refresh, false),
     ]);
-    f.note("Re-import rebuilds the config from what the mouse has stored. Re-apply writes every setting of the config to the mouse again.");
+    f.note("“从鼠标重新导入”会读取鼠标当前板载状态并更新本地 config.toml；“重新写入全部设置”会将本地配置完整同步至鼠标。");
 
-    f.section_icon("Onboard profile", Some(Icon::Layers));
+    f.section_icon("板载配置文件槽位", Some(Icon::Layers));
     let (stored, max) = ui.profiles.unwrap_or((1, 1));
-    let slots: Vec<String> = (1..=max.clamp(1, 5)).map(|n| n.to_string()).collect();
-    f.chips(
-        "Profile in use",
-        "Buttons and Dynamic Sensitivity are written to this onboard profile",
-        &slots,
-        Some((cfg.profile.active as usize).clamp(1, slots.len()) - 1),
-        Id::Profile,
-    );
+    let slots: Vec<String> = (1..=max.clamp(1, 5)).map(|n| format!("槽位 {n}")).collect();
+    f.chips("当前使用的板载配置", "按键映射与动态灵敏度均写入该板载槽位", &slots, Some((cfg.profile.active as usize).clamp(1, slots.len()) - 1), Id::Profile);
     if max <= 1 {
-        f.note("This mouse reports a single onboard profile, so there is nothing to switch to. The selector is here for Razer mice that hold several.");
+        f.note("炼狱蝰蛇 V4 Pro 硬件内置 1 个板载配置槽位（无需手动切换），多配置切换可通过“游戏配置”页面实现自动无感切换。");
     } else {
-        f.note(&format!("The mouse holds {stored} of {max} profiles. Selecting an empty slot creates it and writes this config to it."));
+        f.note(&format!("该鼠标支持 {max} 个板载槽位（当前已存 {stored} 个）。"));
     }
 
     if ui.wireless && ui.spec.pairing {
-        f.section_icon("Dongle pairing", Some(Icon::Link));
+        f.section_icon("接收器无线配对", Some(Icon::Link));
         match &ui.paired {
             Some(list) if !list.is_empty() => {
                 for d in list {
                     let state = match d.status {
-                        0 => "not connected",
-                        1 => "connected",
-                        _ => "state unknown",
+                        0 => "未连接",
+                        1 => "已连接",
+                        _ => "状态未知",
                     };
-                    f.info("Paired device", &format!("product id 0x{:04x}  ·  {state}", d.product_id));
+                    f.info("已配对设备", &format!("产品 ID 0x{:04x}  ·  {state}", d.product_id));
                 }
             }
-            Some(_) => f.info("Paired device", "none reported"),
-            None => f.info("Paired device", "-"),
+            Some(_) => f.info("已配对设备", "未报告"),
+            None => f.info("已配对设备", "-"),
         }
         if ui.pairing_since.is_some() {
-            f.note("Pairing mode is on: switch the mouse off and on (or plug the dongle in next to it). A newly paired mouse shows up above.");
-            f.buttons(&[("Cancel pairing", Id::PairCancel, true)]);
+            f.note("接收器正在配对模式中：请将鼠标靠近接收器并拨动电源开关重启一次。");
+            f.buttons(&[("取消配对", Id::PairCancel, true)]);
         } else {
-            f.buttons(&[("Pair a device", Id::PairStart, true), (if ui.confirm_unpair { "Yes, unpair" } else { "Unpair this mouse" }, Id::Unpair, false)]);
+            f.buttons(&[("配对新设备", Id::PairStart, true), (if ui.confirm_unpair { "确认取消配对" } else { "取消配对此鼠标" }, Id::Unpair, false)]);
         }
         if let Some(on) = ui.auto_pair {
-            f.toggle("Auto-pairing", "Let the dongle pair with a compatible mouse by itself", on, Id::AutoPair);
+            f.toggle("自动配对", "允许接收器自动配对兼容鼠标", on, Id::AutoPair);
         }
-        f.note("Same commands as Synapse's device pairing. Unpairing makes the dongle forget the mouse; it stops working until paired again, so use it only to move the mouse to another dongle.");
+        f.note("注意：取消配对会让接收器忘记当前鼠标，仅在需要将鼠标迁移到另一个接收器时使用。");
     }
 
-    f.section_icon("Device", Some(Icon::Info));
-    let model = ui.spec.name.split(" (").next().unwrap_or(&ui.spec.name);
-    let link = if ui.wireless { "via its wireless dongle" } else { "wired" };
+    f.section_icon("当前硬件信息", Some(Icon::Info));
+    let model = display_model(&ui.spec.name);
+    let link = if ui.wireless { "通过无线接收器连接" } else { "USB 有线直连" };
     let trust = if ui.spec.verified {
-        ""
+        "  ·  已完整适配验证"
     } else if ui.cfg.device.allow_unverified.allows(ui.spec.product_id) {
-        "  ·  unverified, writes allowed on the Devices page"
+        "  ·  测试写入模式"
     } else {
-        "  ·  unverified: read-only until writes are allowed on the Devices page"
+        "  ·  只读保护模式"
     };
     if ui.spec.is_placeholder() {
-        f.info("Mouse", "none opened yet");
+        f.info("连接设备", "尚未打开鼠标");
     } else {
-        f.info("Mouse", &format!("{model}, {link} (product id 0x{:04x}){trust}", ui.spec.product_id));
+        f.info("连接设备", &format!("{model}（{link}，PID 0x{:04x}）{trust}", ui.spec.product_id));
     }
-    f.info("Mouse firmware", &ui.fw.map(|(a, b)| format!("{a}.{b}")).unwrap_or_else(|| "-".into()));
+    f.info("鼠标固件版本", &ui.fw.map(|(a, b)| format!("v{a}.{b}")).unwrap_or_else(|| "-".into()));
     if ui.wireless {
-        f.info("Dongle firmware", &ui.dongle_fw.map(|(a, b)| format!("{a}.{b}")).unwrap_or_else(|| "-".into()));
+        f.info("接收器固件版本", &ui.dongle_fw.map(|(a, b)| format!("v{a}.{b}")).unwrap_or_else(|| "-".into()));
     }
-    f.info("Serial", ui.serial.as_deref().unwrap_or("-"));
-    f.info("Config file", &crate::config_path().to_string_lossy());
+    let masked_serial = ui.serial.as_deref().map(crate::probe::mask_serial_text);
+    f.info("鼠标序列号", masked_serial.as_deref().unwrap_or("-"));
+    f.info("本地配置文件", &redact_user_path(&crate::config_path()));
     f.info(
-        "State",
+        "当前连接状态",
         if ui.pending {
-            "changes pending (mouse asleep)"
+            "有待同步的更改（等待鼠标唤醒）"
         } else if ui.asleep {
-            "mouse asleep"
+            "无线休眠中"
         } else if ui.battery.is_some() {
-            "connected"
+            "在线已连接"
         } else {
-            "not connected"
+            "未连接"
         },
     );
-    f.info("Version", &format!("freenapse {}", crate::VERSION));
-    f.info("Diagnostics", "after a crash, crash.txt in the config file's folder; freenapse --log records every exchange with the mouse in hid.log there");
+    f.info("软件名称", "Freenapse-DeathAdder V4 Pro");
+    f.info("软件版本", &format!("v{}", crate::VERSION));
+    f.info("故障诊断", "启动时加 --log 参数可在配置文件目录生成 hid.log 记录每次 USB 通信报文");
 
-    f.section_icon("About", Some(Icon::Help));
-    f.note("freenapse replaces Razer Synapse 4 with two small native programs and no services. Every setting is kept in the mouse's onboard memory, so it stays the same on any computer. The Devices page lists every mouse freenapse knows and how far each one goes.");
-    f.link("Supported mice", "freenapse.app/devices", "https://freenapse.app/devices/", "every mouse and how far freenapse goes with it");
-    f.link("Website", "freenapse.app", "https://freenapse.app", "downloads, changelog and guides");
-    f.link("Source code", "github.com/MatthewSaintBull/freenapse", "https://github.com/MatthewSaintBull/freenapse", "");
-    f.info("License", "MIT, by MatthewSaintbull. Not affiliated with Razer Inc.");
-    f.note("Esc closes this window; the tray icon stays.");
+    f.section_icon("DeathAdder V4 Pro 专属适配特性", Some(Icon::Check));
+    f.bullet(ACCENT, "完整适配 HyperSpeed 二代半球形接收器协议：支持固件/序列号读取、左/中/右 3 颗指示灯独立映射与亮度调节。");
+    f.bullet(ACCENT, "精准匹配 Focus Pro 45K 二代传感器非对称抬起截断回读格式、45,000 DPI 上限与有线/无线双 8000 Hz 回报率。");
+    f.bullet(ACCENT, "右手人体工学俯视轮廓图示 + 底部 DPI/电源键专属键位交互，全中文界面与托盘菜单。");
+
+    f.section_icon("关于 Freenapse-DeathAdder V4 Pro", Some(Icon::Help));
+    f.note("在原版 freenapse 0.5.2 基础上增加适配炼狱蝰蛇 V4 Pro 并作出性能与安全优化，纯原生 Win32 + Rust 编写，单文件零后台服务，核心设置直写鼠标板载内存。");
+    f.link("本项目仓库", "github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro", "https://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro", "");
+    f.link("上游原版仓库", "github.com/MatthewSaintBull/freenapse", "https://github.com/MatthewSaintBull/freenapse", "");
+    f.info("开源协议", "MIT License · 独立开源项目，与 Razer Inc. 无关联");
+    f.note("按 Esc 键可随时关闭此设置窗口，系统托盘图标将继续在后台静默运行。");
+}
+
+/// Replace the leading `%USERPROFILE%` directory (e.g. `C:\Users\Alice`) with `%USERPROFILE%`
+/// so screenshots of the Settings page never leak the Windows account name.
+fn redact_user_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(home) = std::env::var_os("USERPROFILE").and_then(|v| {
+        let s = v.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    }) && raw.len() >= home.len()
+        && raw.is_char_boundary(home.len())
+        && raw[..home.len()].eq_ignore_ascii_case(&home)
+    {
+        return format!("%USERPROFILE%{}", &raw[home.len()..]);
+    }
+    raw.into_owned()
 }
 
 /// Rows an owner has partly tested (reads and some writes), short of verified.
@@ -1466,14 +1624,10 @@ fn device_status(d: &DeviceSpec) -> Status {
 
 /// One line per model and status: wired and wireless rows of the same mouse
 /// share a line when they have the same status. (model, rows)
-fn device_models(st: Status) -> Vec<(&'static str, Vec<&'static DeviceSpec>)> {
-    let mut out: Vec<(&'static str, Vec<&'static DeviceSpec>)> = Vec::new();
+fn device_models(st: Status) -> Vec<(String, Vec<&'static DeviceSpec>)> {
+    let mut out: Vec<(String, Vec<&'static DeviceSpec>)> = Vec::new();
     for d in crate::device::DEVICES.iter().filter(|d| device_status(d) == st) {
-        let name: &'static str = match &d.name {
-            std::borrow::Cow::Borrowed(s) => s,
-            std::borrow::Cow::Owned(_) => continue,
-        };
-        let model = name.split(" (").next().unwrap_or(name).trim_start_matches("Razer ");
+        let model = display_model(&d.name);
         match out.iter_mut().find(|(m, _)| *m == model) {
             Some((_, rows)) => rows.push(d),
             None => out.push((model, vec![d])),
@@ -1482,20 +1636,23 @@ fn device_models(st: Status) -> Vec<(&'static str, Vec<&'static DeviceSpec>)> {
     out
 }
 
-/// "0x00C0 wired, 0x00C1 wireless  ·  35000 DPI  ·  125-8000 Hz  ·  7 buttons"
+/// "0x00BE 有线, 0x00BF 无线  ·  45000 DPI  ·  125-8000 Hz  ·  8 键"
 fn device_note(rows: &[&DeviceSpec]) -> String {
-    let ids: Vec<String> = rows.iter().map(|d| format!("0x{:04X} {}", d.product_id, if d.wireless { "wireless" } else { "wired" })).collect();
+    let ids: Vec<String> = rows.iter().map(|d| format!("0x{:04X} {}", d.product_id, if d.wireless { "无线" } else { "有线" })).collect();
     let dpi = rows.iter().map(|d| d.dpi_max).max().unwrap_or(0);
     let hz = rows.iter().flat_map(|d| d.polling_rates.iter().copied()).max().unwrap_or(1000);
     let mut parts = vec![ids.join(", "), format!("{dpi} DPI"), format!("125-{hz} Hz")];
     if device_status(rows[0]) != Status::ReadOnly {
-        parts.push(format!("{} buttons", rows[0].buttons.len()));
+        parts.push(format!("{} 键", rows[0].buttons.len()));
+    }
+    if rows.iter().any(|d| d.dongle == DongleKind::Gen2Dome) {
+        parts.push("三灯半球接收器".into());
     }
     if !rows[0].lighting.is_empty() {
-        parts.push("lighting".into());
+        parts.push("RGB 灯效".into());
     }
     if !rows.iter().any(|d| d.battery) {
-        parts.push("no battery".into());
+        parts.push("有线无电池".into());
     }
     parts.join("  \u{b7}  ")
 }
@@ -1504,45 +1661,35 @@ fn device_note(rows: &[&DeviceSpec]) -> String {
 fn devices(ui: &Ui, f: &mut Form) {
     let here = |rows: &[&DeviceSpec]| ui.battery.is_some() && rows.iter().any(|d| d.product_id == ui.spec.product_id);
 
-    f.section_icon("Connected", Some(Icon::Mouse));
+    f.section_icon("当前已连接设备", Some(Icon::Mouse));
     if ui.battery.is_some() {
-        let model = ui.spec.name.split(" (").next().unwrap_or(&ui.spec.name);
+        let model = display_model(&ui.spec.name);
         let allowed = ui.cfg.device.allow_unverified.allows(ui.spec.product_id);
         let state = match (ui.spec.verified, allowed) {
-            (true, _) => "verified, every setting is written",
-            (false, true) => "not verified: writes allowed by you, for testing",
-            (false, false) => "not verified: read-only",
+            (true, _) => "已验证适配，全部设置可直接写入板载内存",
+            (false, true) => "未验证型号：已手动开启测试写入权限",
+            (false, false) => "未验证型号：当前处于只读保护模式",
         };
-        f.info("Mouse", &format!("{model} (product id 0x{:04x})  \u{b7}  {state}", ui.spec.product_id));
+        f.info("鼠标型号", &format!("{model}（PID 0x{:04x}）  \u{b7}  {state}", ui.spec.product_id));
     } else {
-        f.info("Mouse", "none connected");
+        f.info("鼠标型号", "当前未检测到连接");
     }
     // The owner's opt-in, per product id ([device] allow_unverified in the config file).
     if !ui.spec.verified && !ui.spec.is_placeholder() {
         let allowed = ui.cfg.device.allow_unverified.allows(ui.spec.product_id);
         let sub = if allowed {
-            "On: changes you make here, in the tray and with the CLI are written to this mouse"
+            "已开启：窗口、托盘与命令行中的修改将直接写入此鼠标"
         } else {
-            "Off: freenapse only reads this mouse. Switch on to test writes on it, at your own risk"
+            "已关闭：仅读取状态，开启后可对此型号测试写入"
         };
-        f.toggle("Allow writes to this mouse", sub, allowed, Id::AllowUnverified);
-        f.note("This applies to this model only (its product id); any other unverified mouse stays read-only. After testing, please report what the mouse accepted and refused in a \"New mouse\" issue so it can be marked verified.");
+        f.toggle("允许向此鼠标写入设置", sub, allowed, Id::AllowUnverified);
+        f.note("该权限仅针对当前连接的产品 ID 生效，其他未验证型号仍保持只读安全状态。");
     }
 
     let groups: [(&str, Icon, Status, &str); 3] = [
-        ("Verified", Icon::Check, Status::Verified, "Tested write by write on the mouse and read back. freenapse writes to these without asking."),
-        (
-            "Being tested",
-            Icon::Warning,
-            Status::Testing,
-            "An owner has read back part of the settings. Writes need the owner's opt-in: the switch above with the mouse connected.",
-        ),
-        (
-            "Read-only",
-            Icon::Info,
-            Status::ReadOnly,
-            "Product id, polling command and DPI ceiling are known; status and probe work, every write is refused until its owner allows them with the switch above to test the mouse.",
-        ),
+        ("已完整验证", Icon::Check, Status::Verified, "已完成真机逐项写入与回读校验，开箱即用。"),
+        ("测试中", Icon::Warning, Status::Testing, "已完成部分功能验证，需在上方手动开启写入开关。"),
+        ("已知型号（默认只读）", Icon::Info, Status::ReadOnly, "已内置传感器上限与回报率参数，默认只读保护，开启上方开关后可测试写入。"),
     ];
     for (title, icon, st, text) in groups {
         let rows = device_models(st);
@@ -1554,103 +1701,58 @@ fn devices(ui: &Ui, f: &mut Form) {
         for (model, specs) in &rows {
             let mut note = device_note(specs);
             if here(specs) {
-                note.push_str("  \u{b7}  connected");
+                note.push_str("  \u{b7}  当前连接");
             }
             f.status(st, model, &note);
         }
     }
 
-    f.section_icon("Any other Razer mouse", Some(Icon::Help));
-    f.note("It opens read-only with the classic polling command and a 30000 DPI ceiling assumed. To add it: run freenapse probe, paste the output into a \"New mouse\" issue on GitHub, then test the writes and send its row of src/device.rs (CONTRIBUTING.md has the steps).");
-    f.link("Same list online", "freenapse.app/devices", "https://freenapse.app/devices/", "");
-    f.link("New mouse issue", "github.com/MatthewSaintBull/freenapse/issues", "https://github.com/MatthewSaintBull/freenapse/issues/new/choose", "");
+    f.section_icon("其他雷蛇鼠标", Some(Icon::Help));
+    f.note("不在上表中的雷蛇鼠标将以只读安全模式打开。运行 `freenapse probe` 可扫描其全部寄存器与按键编码。");
 }
 
-/// Feature status and release roadmap (same content as ROADMAP.md).
+/// Feature status and release roadmap.
 fn roadmap(f: &mut Form) {
     use Status::*;
-    f.section_icon("Feature status", Some(Icon::Flag));
-    f.note("What freenapse does today compared with Razer Synapse 4. Done is verified on the mouse; Partial works with limits; Planned is on the list; No is out of scope.");
+    f.section_icon("功能支持对照表", Some(Icon::Flag));
+    f.note("当前定制版对比 Razer Synapse 4（雷云 4）的各项板载与软件功能支持情况。");
 
-    f.section("Performance");
-    f.status(Done, "DPI stages and active stage", "up to 5 stages, CLI, config and this window");
-    f.status(Done, "Live DPI", "from 100 up to the mouse's maximum (20000 to 45000 by model), 1 DPI steps");
-    f.status(Done, "Independent X/Y DPI", "CLI, config (y_stages) and the X/Y toggle above");
-    f.status(Done, "Polling rate 125..8000 Hz", "8000 needs the HyperPolling dongle");
-    f.status(Done, "In-game polling rate", "while a game with a profile is in the foreground");
-    f.status(Done, "Sensor rotation", "angle tune -30..30 degrees");
-    f.status(Done, "Dynamic Sensitivity", "Classic / Natural / Jump presets and a custom curve editor, stored onboard");
-    f.status(Never, "Sensitivity Matcher", "software-only Synapse helper; set the DPI you want");
+    f.section("性能 (Performance)");
+    f.status(Done, "最多 5 档 DPI 与当前档位切换", "支持 100 至 45000 DPI，1 DPI 步进直写板载");
+    f.status(Done, "X / Y 轴独立灵敏度", "水平与垂直方向可分别指定不同 DPI");
+    f.status(Done, "125 .. 8000 Hz 原生无线/有线回报率", "支持炼狱蝰蛇 V4 Pro 原生双 8K 回报率");
+    f.status(Done, "游戏前台自动高回报率", "平时低回报率省电，进游戏自动切 4000 / 8000 Hz");
+    f.status(Done, "传感器角度校准 (Rotation)", "-30° 至 +30° 握姿角度微调");
+    f.status(Done, "动态灵敏度 (Dynamic Sensitivity)", "经典 / 自然 / 跃迁预设及自定义样条曲线编辑器");
+    f.status(Never, "灵敏度匹配器", "纯软件测算工具，直接输入目标 DPI 即可");
 
-    f.section("Calibration");
-    f.status(Done, "Smart Tracking 1/2/3 mm", "");
-    f.status(Done, "Asymmetric cut-off", "lift-off 2..26 and landing 1..25, written in the same sequence Synapse uses; mice with the Focus Pro tracking page");
-    f.status(
-        Never,
-        "Surface calibration, mouse-mat presets",
-        "only tried on the Viper V3 Pro, where Synapse offers none and the firmware refuses the commands",
-    );
-    f.status(Partial, "Read back current calibration", "the asymmetric levels cannot be read, so \"Keep current\" leaves them as they are");
+    f.section("传感器校准 (Calibration)");
+    f.status(Done, "Focus Pro 45K 智能追踪 (1 / 2 / 3 mm)", "对称抬起截断距离板载存储");
+    f.status(Done, "非对称抬起截断 (2..26 / 1..25)", "支持炼狱蝰蛇 V4 Pro 非对称抬起与着陆等级双向读写");
 
-    f.section("Power");
-    f.status(Done, "Battery level and charging", "tray icon, window header, CLI");
-    f.status(Done, "Low battery notification", "threshold in config and window");
-    f.status(Done, "Idle sleep timer", "1..15 minutes");
-    f.status(Done, "Low power mode threshold", "5..100 %; the firmware ignores it at 2000 Hz and above, like Synapse");
-    f.status(Done, "Dongle LED mode", "HyperPolling dongle");
+    f.section("电源与接收器 (Power)");
+    f.status(Done, "实时电量百分比与充电状态", "托盘图标动态绘制电量、窗口大电池卡片");
+    f.status(Done, "空闲休眠时长与低功耗阈值", "1..15 分钟自动休眠，5..100% 低电量节能");
+    f.status(Done, "HyperSpeed 二代半球形接收器 3 颗指示灯", "左 / 中 / 右三灯独立映射（电量/连接/回报率/DPI/关闭）及 4 档亮度");
+    f.status(Done, "HyperPolling 单灯接收器模式", "兼容一代 HyperPolling 接收器");
+    f.status(Partial, "接收器无线重新配对", "一代 HyperPolling 支持完整配对；二代半球形接收器对码暂需官方配对工具");
 
-    f.section("Customize");
-    f.status(Done, "Button remapping", "every button of the mouse's layout, normal and Hypershift layer, onboard");
-    f.status(Done, "Button functions", "mouse, keyboard with modifiers, media, DPI stage / cycle, Hypershift, disabled");
-    f.status(Done, "Double-click, turbo, system keys", "double click, turbo with a repeat rate, sleep / power / wake");
-    f.status(
-        Partial,
-        "Profile switch button",
-        "the profile functions can be bound to any button; they only do something on a mouse that holds several onboard profiles",
-    );
-    f.status(Done, "Macros", "record here or write steps in the config; once / N times / held / toggle / sequence. Stored onboard when the mouse has macro memory, otherwise played by the tray app, like Synapse does");
-    f.status(
-        Done,
-        "Program and Text buttons",
-        "start a program or open a file / URL, type a text; played by the tray app like macros. Windows shortcuts are plain Keyboard keys (win+d)",
-    );
+    f.section("按键自定义与宏 (Customize)");
+    f.status(Done, "全按键映射（标准层 + Hypershift 层）", "左/右/中/前进/后退/滚轮上下/底部 DPI 键全部板载重映射");
+    f.status(Done, "双击、连发 (Turbo)、多媒体与系统电源键", "1..50 次/秒硬件连发、音量静音、睡眠关机");
+    f.status(Done, "宏录制与五种播放模式", "单次 / N 次 / 按住循环 / 切换开关 / 步进序列");
+    f.status(Done, "一键启动程序与 Unicode 文本输入", "支持一键输入任意中文短语或打开程序/网页");
 
-    f.section("App and device");
-    f.status(Done, "Settings window, immediate apply", "pending while the mouse sleeps, written when it wakes");
-    f.status(Done, "Tray icon", "battery, DPI stage, polling rate menu");
-    f.status(Done, "Config file, import, re-apply", "%APPDATA%\\freenapse\\config.toml");
-    f.status(Done, "Start at login", "registry Run key");
-    f.status(Done, "Firmware and serial numbers", "mouse and dongle");
-    f.status(Done, "Onboard profile selection", "config, CLI and the gear page; a mouse that reports one profile accepts only 1");
-    f.status(Done, "Per-game profiles", "DPI stage, polling rate and button layout per game, switched by the tray app");
-    f.status(Done, "Game library", "Steam, Epic, GOG, EA app, Battle.net, Riot, Ubisoft, Rockstar, Xbox; any other program by file dialog");
-    f.status(Done, "Dongle pairing", "pair, cancel, unpair and auto-pairing from the gear page and the CLI");
-    f.status(Todo, "Bluetooth", "no verified mouse uses it yet; kept for the ones that do");
-    f.status(Partial, "Other Razer mice", "a device table decides what each model accepts: verified, being tested or read-only, see the Devices page");
-    f.status(Never, "Firmware update", "use Razer's updater once if you need it");
-    f.status(Partial, "Chroma lighting", "off, static, breathing and spectrum per zone on mice with LEDs (Basilisk V2); no wave or per-key frames");
-    f.status(Never, "Account, cloud", "telemetry too; by design");
-
-    f.section_icon("Next release: done", Some(Icon::Checklist));
-    f.bullet(ACCENT, "Macros: record on the Customize tab (keys, mouse buttons, wheel, delays) and bind with the five playback options. On a mouse without macro memory the tray app plays them from an F13..F24 key, as Synapse does; verified: slot key read back from the mouse, key press played the macro.");
-    f.bullet(ACCENT, "Per-game profiles: DPI stage, polling rate and a button layout per program; verified: polling and buttons switched 2 s after Notepad took the foreground and came back after it closed.");
-    f.bullet(ACCENT, "Dongle pairing: pair, cancel, unpair on the gear page and in the CLI; verified: paired list, pairing mode start and cancel (unpair not run on purpose; auto-pairing not supported by this dongle).");
-
-    f.section("Previous release");
-    f.bullet(MUTED, "Double-click, turbo and system keys; Dynamic Sensitivity with a curve editor; independent X/Y DPI; onboard profile selection; Calibration tab rebuilt on Synapse's engine for the Focus Pro tracking page.");
-
-    f.section_icon("Later", Some(Icon::Checklist));
-    f.bullet(BLUE, "Program and Text buttons: start a program or type a text with a button; the tray app plays them like macros. Hot-plug and wake-up reconnect, the config file re-applied when edited, and a once-a-day update notice.");
-    f.bullet(BLUE, "A product table so other Razer mice sharing this protocol can be added without code changes.");
-    f.bullet(BLUE, "Single-file signed download.");
-    f.bullet(MUTED, "Bluetooth connection support for mice that have it.");
-
-    f.section("Not planned");
-    f.note("Razer account, cloud profile sync, telemetry, firmware updates and Sensitivity Matcher. The point of freenapse is to do without them.");
+    f.section("软件体验");
+    f.status(Done, "单文件免安装、零后台服务", "仅约 1 MB，内存占用约 10 MB，远离 1.5 GB 电子垃圾");
+    f.status(Done, "Steam / Epic / 战网 / Xbox 游戏库自动扫描", "自动提取本地游戏封面生成配置卡片");
+    f.status(Done, "有线 USB-C 模式 (PID 0x00BE) 协议适配", "共享 v1.20 鼠标固件指令（0x1f），插线充电时无缝读写板载");
+    f.status(Todo, "二代半球形接收器工具内重新对码", "后续研究 0x00BF 专用无线对码序列，免官方工具更换接收器");
+    f.status(Never, "雷蛇账号登录、云同步与后台遥测", "完全本地离线运行，保护隐私");
 }
 
 // ----------------------------------------------------------------------
-// Mouse illustration (top view) with clickable button areas.
+// Mouse illustration (top view, DeathAdder V4 Pro ergonomic contour)
 // ----------------------------------------------------------------------
 
 /// Geometry of the drawing in logical units relative to the art box.
@@ -1661,15 +1763,61 @@ struct MouseGeom {
     h: i32,
 }
 
-fn geom(x: i32, y: i32, w: i32, h: i32) -> MouseGeom {
-    let mh = (h - 20).min(300);
-    let mw = (mh * 62 / 100).min(w - 140);
-    MouseGeom { cx: x + w / 2 + 20, top: y + (h - mh) / 2, w: mw, h: mh }
+fn geom(x: i32, y: i32, w: i32, h: i32, bottom_dpi: bool) -> MouseGeom {
+    let reserve = if bottom_dpi { 44 } else { 20 };
+    let mh = (h - reserve).min(290);
+    let mw = (mh * 62 / 100).min(w - 160);
+    let top_y = y + ((h - reserve - mh).max(8)) / 2;
+    MouseGeom { cx: x + w / 2 + 12, top: top_y, w: mw, h: mh }
+}
+
+/// True when the mouse has the 8-button layout with its DPI/power button physically underneath
+/// (DeathAdder V4 Pro, Viper V3 Pro), rather than behind the scroll wheel (Basilisk V3).
+fn has_bottom_dpi(buttons: &[crate::device::PhysicalButton]) -> bool {
+    buttons.iter().any(|b| b.name == "dpi") && !buttons.iter().any(|b| b.name == "scroll-mode" || b.name == "tilt-left")
+}
+
+/// Right-handed ergonomic contour (DeathAdder V4 Pro top-down silhouette),
+/// expressed in (dx_pct_of_half_w, y_pct_of_h) around `g.cx` and `g.top`.
+fn ergo_contour(g: &MouseGeom, dx: impl Fn(i32) -> i32, dy: impl Fn(i32) -> i32) -> Vec<POINT> {
+    // Asymmetric flared front-left trigger, sculpted left thumb waist, ergonomic right palm swell.
+    const PTS: &[(i32, i32)] = &[
+        (-12, 0),
+        (-36, 2),
+        (-72, 7),
+        (-96, 15),
+        (-104, 24),
+        (-100, 34),
+        (-92, 44),
+        (-89, 54),
+        (-94, 66),
+        (-100, 77),
+        (-96, 87),
+        (-80, 94),
+        (-52, 99),
+        (-18, 100),
+        (18, 100),
+        (54, 98),
+        (82, 92),
+        (98, 83),
+        (105, 71),
+        (104, 58),
+        (98, 45),
+        (95, 33),
+        (95, 21),
+        (88, 12),
+        (66, 6),
+        (34, 2),
+        (6, 0),
+    ];
+    let hw = g.w / 2;
+    PTS.iter().map(|(px, py)| POINT { x: dx(g.cx + hw * px / 100), y: dy(g.top + g.h * py / 100) }).collect()
 }
 
 /// Clickable regions (button index → scaled rect), computed with the same geometry as the drawing.
 fn mouse_regions(f: &Form, x: i32, y: i32, w: i32, h: i32, buttons: &[crate::device::PhysicalButton]) -> Vec<(usize, RECT)> {
-    let g = geom(x, y, w, h);
+    let bottom_dpi = has_bottom_dpi(buttons);
+    let g = geom(x, y, w, h, bottom_dpi);
     let s = |v: i32| f.s(v);
     let l = g.cx - g.w / 2;
     let split = g.top + g.h * 42 / 100;
@@ -1682,27 +1830,21 @@ fn mouse_regions(f: &Form, x: i32, y: i32, w: i32, h: i32, buttons: &[crate::dev
         .filter_map(|(name, (ex, ey, ew, eh))| buttons.iter().position(|b| b.name == name).map(|i| (i, r(ex, ey, ew, eh))))
         .collect();
     v.extend([
-        (0, r(l, g.top, g.w / 2, split - g.top)),
-        (1, r(g.cx, g.top, g.w / 2, split - g.top)),
+        (0, r(l - 4, g.top, g.w / 2 + 4, split - g.top)),
+        (1, r(g.cx, g.top, g.w / 2 + 4, split - g.top)),
         (2, r(g.cx - wheel_w / 2, wheel_y, wheel_w, wheel_h)),
         (5, r(g.cx - wheel_w / 2 - 4, wheel_y - 18, wheel_w + 8, 18)),
         (6, r(g.cx - wheel_w / 2 - 4, wheel_y + wheel_h, wheel_w + 8, 18)),
-        (3, r(l - 14, g.top + g.h * 48 / 100, 20, g.h * 12 / 100)),
-        (4, r(l - 14, g.top + g.h * 34 / 100, 20, g.h * 12 / 100)),
+        (3, r(l - 12, g.top + g.h * 48 / 100, 22, g.h * 13 / 100)),
+        (4, r(l - 12, g.top + g.h * 33 / 100, 22, g.h * 13 / 100)),
     ]);
     v
 }
 
-/// Where the buttons beyond the seven clicks sit on the drawing, in unscaled
-/// coordinates: the DPI button (or the Basilisk's DPI up and down) behind the
-/// wheel, the tilts on either side of it, the clutch on the side below the
-/// side buttons. On some mice (the Viper V3 Pro) the DPI button is really
-/// underneath; the drawing puts it where a hand would look for it.
-/// (x, y, w, h)
 type Area = (i32, i32, i32, i32);
 
 fn extra_shapes(g: &MouseGeom, buttons: &[crate::device::PhysicalButton]) -> Vec<(&'static str, Area)> {
-    // A scroll-mode button sits right behind the wheel and pushes the DPI button back.
+    let bottom_dpi = has_bottom_dpi(buttons);
     let dpi_at = if buttons.iter().any(|b| b.name == "scroll-mode") { 37 } else { 32 };
     let l = g.cx - g.w / 2;
     let wheel_w = g.w / 6;
@@ -1710,11 +1852,17 @@ fn extra_shapes(g: &MouseGeom, buttons: &[crate::device::PhysicalButton]) -> Vec
     let wheel_y = g.top + g.h * 12 / 100;
     let dpi_w = wheel_w - 6;
     let dpi_h = g.h * 4 / 100;
+    let dpi_rect = if bottom_dpi {
+        let bw = (g.w * 42 / 100).max(56);
+        (g.cx - bw / 2, g.top + g.h + 10, bw, 22)
+    } else {
+        (g.cx - dpi_w / 2, g.top + g.h * dpi_at / 100, dpi_w, dpi_h)
+    };
     vec![
         ("tilt-left", (g.cx - wheel_w / 2 - 14, wheel_y + wheel_h / 4, 10, wheel_h / 2)),
         ("tilt-right", (g.cx + wheel_w / 2 + 4, wheel_y + wheel_h / 4, 10, wheel_h / 2)),
         ("scroll-mode", (g.cx - dpi_w / 2, g.top + g.h * 32 / 100, dpi_w, dpi_h)),
-        ("dpi", (g.cx - dpi_w / 2, g.top + g.h * dpi_at / 100, dpi_w, dpi_h)),
+        ("dpi", dpi_rect),
         ("dpi-up", (g.cx - dpi_w / 2, g.top + g.h * 32 / 100, dpi_w, dpi_h)),
         ("dpi-down", (g.cx - dpi_w / 2, g.top + g.h * 37 / 100, dpi_w, dpi_h)),
         ("clutch", (l - 12, g.top + g.h * 62 / 100, 16, g.h * 8 / 100)),
@@ -1724,51 +1872,90 @@ fn extra_shapes(g: &MouseGeom, buttons: &[crate::device::PhysicalButton]) -> Vec
 pub unsafe fn draw_mouse(ui: &Ui, dc: HDC, r: &RECT, highlight: usize, regions: &[(usize, RECT)]) {
     let s = |v: i32| ui.s(v);
     let scale = ui.scale;
+    let bottom_dpi = has_bottom_dpi(ui.buttons());
+    let ergo = ui.spec.is_ergonomic();
     // Work in device pixels: regions already are; rebuild the geometry from the rect.
     let (x, y, w, h) = ((r.left as f32 / scale) as i32, 0, ((r.right - r.left) as f32 / scale) as i32, ((r.bottom - r.top) as f32 / scale) as i32);
-    let g = geom(x, y, w, h);
+    let g = geom(x, y, w, h, bottom_dpi);
     let oy = r.top; // device offset for the top of the art box
     let dx = |v: i32| s(v);
     let dy = |v: i32| s(v) + oy;
 
     let l = g.cx - g.w / 2;
     let rt = g.cx + g.w / 2;
-    let split = g.top + g.h * 42 / 100;
-    let body = RECT { left: dx(l), top: dy(g.top), right: dx(rt), bottom: dy(g.top + g.h) };
+    let split_l = g.top + g.h * 43 / 100;
+    let split_r = if ergo { g.top + g.h * 45 / 100 } else { split_l };
+    let body = RECT { left: dx(l - 6), top: dy(g.top), right: dx(rt + 6), bottom: dy(g.top + g.h) };
     let hl = |i: usize| if highlight == i { (ACCENT_HI, ACCENT) } else { (rgb(0x46, 0x47, 0x4b), rgb(0x34, 0x35, 0x38)) };
 
-    // Body silhouette (rounded, lit from the top), then the two main buttons on top of it.
-    shadow(dc, &body, s(g.w / 2), 4);
-    clip_round(dc, &body, s(g.w / 2), || vgradient(dc, &body, rgb(0x3a, 0x3b, 0x3e), rgb(0x24, 0x25, 0x27)));
     let btn = |i: usize| -> RECT {
         if i == 0 {
-            RECT { left: dx(l), top: dy(g.top), right: dx(g.cx), bottom: dy(split) }
+            RECT { left: dx(l - 8), top: dy(g.top), right: dx(g.cx), bottom: dy(split_l) }
         } else {
-            RECT { left: dx(g.cx), top: dy(g.top), right: dx(rt), bottom: dy(split) }
+            RECT { left: dx(g.cx), top: dy(g.top), right: dx(rt + 8), bottom: dy(split_r) }
         }
     };
-    // Clip the button fills to the body outline.
-    let rgn = windows_sys::Win32::Graphics::Gdi::CreateRoundRectRgn(body.left, body.top, body.right + 1, body.bottom + 1, s(g.w), s(g.w));
-    windows_sys::Win32::Graphics::Gdi::SelectClipRgn(dc, rgn);
-    for i in 0..2 {
-        let (top, bot) = hl(i);
-        vgradient(dc, &btn(i), top, bot);
-    }
-    // Light from the top left.
-    reflection(dc, &body, 34);
-    windows_sys::Win32::Graphics::Gdi::SelectClipRgn(dc, 0);
-    windows_sys::Win32::Graphics::Gdi::DeleteObject(rgn);
-    round(dc, &body, s(g.w / 2), None, Some((rgb(0x5a, 0x5b, 0x5e), s(2))));
-    polyline(dc, &[POINT { x: dx(g.cx), y: dy(g.top + 6) }, POINT { x: dx(g.cx), y: dy(split) }], BG, s(2));
-    polyline(dc, &[POINT { x: dx(l + 2), y: dy(split) }, POINT { x: dx(rt - 2), y: dy(split) }], BG, s(2));
 
-    // Scroll wheel and the scroll up/down arrows.
+    if ergo {
+        let contour = ergo_contour(&g, dx, dy);
+        // Subtle drop shadow under the ergonomic shell.
+        let sh_pts: Vec<POINT> = contour.iter().map(|p| POINT { x: p.x, y: p.y + s(4) }).collect();
+        clip_polygon(dc, &sh_pts, || alpha_rect(dc, &offset(&body, 0, s(4)), BLACK, 55));
+        clip_polygon(dc, &contour, || {
+            vgradient(dc, &body, rgb(0x3a, 0x3b, 0x3e), rgb(0x23, 0x24, 0x26));
+            for i in 0..2 {
+                let (top, bot) = hl(i);
+                vgradient(dc, &btn(i), top, bot);
+            }
+            reflection(dc, &body, 32);
+        });
+        // Split keyplate seams of the DeathAdder V4 Pro (independent left/right plates).
+        polyline(dc, &[POINT { x: dx(g.cx), y: dy(g.top + 3) }, POINT { x: dx(g.cx), y: dy(split_r) }], BG, s(2));
+        polyline(
+            dc,
+            &[
+                POINT { x: dx(l - 4), y: dy(split_l - 2) },
+                POINT { x: dx(g.cx - g.w / 7), y: dy(split_l + 2) },
+                POINT { x: dx(g.cx), y: dy(split_l + 3) },
+                POINT { x: dx(g.cx + g.w / 7), y: dy(split_r + 1) },
+                POINT { x: dx(rt + 4), y: dy(split_r - 2) },
+            ],
+            BG,
+            s(2),
+        );
+        polygon(dc, &contour, None, Some((rgb(0x5c, 0x5d, 0x61), s(2))));
+    } else {
+        let sym_body = RECT { left: dx(l), top: dy(g.top), right: dx(rt), bottom: dy(g.top + g.h) };
+        shadow(dc, &sym_body, s(g.w / 2), 4);
+        clip_round(dc, &sym_body, s(g.w / 2), || vgradient(dc, &sym_body, rgb(0x3a, 0x3b, 0x3e), rgb(0x24, 0x25, 0x27)));
+        let rgn = windows_sys::Win32::Graphics::Gdi::CreateRoundRectRgn(sym_body.left, sym_body.top, sym_body.right + 1, sym_body.bottom + 1, s(g.w), s(g.w));
+        windows_sys::Win32::Graphics::Gdi::SelectClipRgn(dc, rgn);
+        for i in 0..2 {
+            let (top, bot) = hl(i);
+            vgradient(dc, &btn(i), top, bot);
+        }
+        reflection(dc, &sym_body, 34);
+        windows_sys::Win32::Graphics::Gdi::SelectClipRgn(dc, 0);
+        windows_sys::Win32::Graphics::Gdi::DeleteObject(rgn);
+        round(dc, &sym_body, s(g.w / 2), None, Some((rgb(0x5a, 0x5b, 0x5e), s(2))));
+        polyline(dc, &[POINT { x: dx(g.cx), y: dy(g.top + 6) }, POINT { x: dx(g.cx), y: dy(split_l) }], BG, s(2));
+        polyline(dc, &[POINT { x: dx(l + 2), y: dy(split_l) }, POINT { x: dx(rt - 2), y: dy(split_l) }], BG, s(2));
+    }
+
+    // Optical scroll wheel with subtle tactile ribs and scroll up/down arrows.
     let wheel_w = g.w / 6;
     let wheel_h = g.h / 7;
     let wheel_y = g.top + g.h * 12 / 100;
     let wheel = RECT { left: dx(g.cx - wheel_w / 2), top: dy(wheel_y), right: dx(g.cx + wheel_w / 2), bottom: dy(wheel_y + wheel_h) };
     let (wt, wb) = hl(2);
-    clip_round(dc, &wheel, s(wheel_w / 2), || vgradient(dc, &wheel, wt, wb));
+    clip_round(dc, &wheel, s(wheel_w / 2), || {
+        vgradient(dc, &wheel, wt, wb);
+        let rib_col = if highlight == 2 { ON_ACCENT } else { rgb(0x25, 0x26, 0x28) };
+        for step in 1..5 {
+            let ry = wheel.top + (wheel.bottom - wheel.top) * step / 5;
+            fill(dc, &rect(wheel.left + s(3), ry, wheel.right - wheel.left - s(6), s(1)), rib_col);
+        }
+    });
     round(dc, &wheel, s(wheel_w / 2), None, Some((BG, s(2))));
     let arrow = |up: bool, col: u32| {
         let cx = dx(g.cx);
@@ -1778,41 +1965,47 @@ pub unsafe fn draw_mouse(ui: &Ui, dc: HDC, r: &RECT, highlight: usize, regions: 
     arrow(true, if highlight == 5 { ACCENT } else { rgb(0x66, 0x66, 0x66) });
     arrow(false, if highlight == 6 { ACCENT } else { rgb(0x66, 0x66, 0x66) });
 
-    // Side buttons (left side of the mouse): forward above back.
-    for (i, frac) in [(4usize, 34), (3usize, 48)] {
-        let sb = RECT { left: dx(l - 10), top: dy(g.top + g.h * frac / 100), right: dx(l + 6), bottom: dy(g.top + g.h * (frac + 12) / 100) };
+    // Large sculpted side buttons (left thumb groove): forward above back.
+    for (i, frac) in [(4usize, 33), (3usize, 48)] {
+        let inset_x = if ergo { 4 } else { 0 };
+        let sb = RECT { left: dx(l - 9 + inset_x), top: dy(g.top + g.h * frac / 100), right: dx(l + 6 + inset_x), bottom: dy(g.top + g.h * (frac + 13) / 100) };
         let (st, sbt) = hl(i);
         clip_round(dc, &sb, s(4), || vgradient(dc, &sb, st, sbt));
         round(dc, &sb, s(4), None, Some((BG, s(2))));
     }
 
-    // Buttons only some mice have, drawn where the open mouse has them.
+    // Extra buttons (either behind wheel on Basilisk, or bottom Power/DPI pill below mouse on DeathAdder V4 Pro).
     for (name, (ex, ey, ew, eh)) in extra_shapes(&g, ui.buttons()) {
         let Some(i) = ui.buttons().iter().position(|b| b.name == name) else { continue };
         let rr = RECT { left: dx(ex), top: dy(ey), right: dx(ex + ew), bottom: dy(ey + eh) };
         let (t, b) = hl(i);
-        clip_round(dc, &rr, s(3), || vgradient(dc, &rr, t, b));
-        round(dc, &rr, s(3), None, Some((BG, s(1))));
+        let rad = if name == "dpi" && bottom_dpi { s(11) } else { s(3) };
+        clip_round(dc, &rr, rad, || vgradient(dc, &rr, t, b));
+        round(dc, &rr, rad, None, Some((if highlight == i { ACCENT_HI } else { LINE }, s(1))));
+        if name == "dpi" && bottom_dpi {
+            let fg = if highlight == i { ON_ACCENT } else { TEXT };
+            text(dc, &rr, "底部 DPI 键", ui.fonts().small, fg, DT_MID);
+        }
     }
 
     // Callout labels with leader lines.
     let label = |i: usize, text_: &str, anchor: POINT, left_side: bool| {
         let col = if highlight == i { ACCENT } else { MUTED };
         let tw = text_width(dc, ui.fonts().small, text_);
-        let lx = if left_side { anchor.x - s(26) - tw } else { anchor.x + s(26) };
-        let end = POINT { x: if left_side { anchor.x - s(22) } else { anchor.x + s(22) }, y: anchor.y };
+        let lx = if left_side { anchor.x - s(24) - tw } else { anchor.x + s(24) };
+        let end = POINT { x: if left_side { anchor.x - s(20) } else { anchor.x + s(20) }, y: anchor.y };
         polyline(dc, &[anchor, end], col, s(1));
         circle(dc, anchor.x, anchor.y, s(3), Some(col), None);
         text(dc, &rect(lx, anchor.y - s(9), tw + s(4), s(18)), text_, ui.fonts().small, col, DT_ROW);
     };
-    // Left side: the left button and the two side buttons. Right side: wheel and right button.
-    label(0, "Left click", POINT { x: dx(l + 4), y: dy(g.top + g.h * 24 / 100) }, true);
-    label(4, "Forward", POINT { x: dx(l - 4), y: dy(g.top + g.h * 40 / 100) }, true);
-    label(3, "Back", POINT { x: dx(l - 4), y: dy(g.top + g.h * 54 / 100) }, true);
-    label(5, "Scroll up", POINT { x: dx(g.cx + 6), y: dy(wheel_y - 10) }, false);
-    label(2, "Middle click", POINT { x: dx(g.cx + wheel_w / 2), y: dy(wheel_y + wheel_h / 2) }, false);
-    label(6, "Scroll down", POINT { x: dx(g.cx + 6), y: dy(wheel_y + wheel_h + 10) }, false);
-    label(1, "Right click", POINT { x: dx(rt - 6), y: dy(g.top + g.h * 38 / 100) }, false);
+    let inset_x = if ergo { 4 } else { 0 };
+    label(0, "左键", POINT { x: dx(l + 2), y: dy(g.top + g.h * 23 / 100) }, true);
+    label(4, "前进侧键", POINT { x: dx(l - 4 + inset_x), y: dy(g.top + g.h * 39 / 100) }, true);
+    label(3, "后退侧键", POINT { x: dx(l - 4 + inset_x), y: dy(g.top + g.h * 54 / 100) }, true);
+    label(5, "滚轮上滚", POINT { x: dx(g.cx + 6), y: dy(wheel_y - 10) }, false);
+    label(2, "中键", POINT { x: dx(g.cx + wheel_w / 2), y: dy(wheel_y + wheel_h / 2) }, false);
+    label(6, "滚轮下滚", POINT { x: dx(g.cx + 6), y: dy(wheel_y + wheel_h + 10) }, false);
+    label(1, "右键", POINT { x: dx(rt - 2), y: dy(g.top + g.h * 36 / 100) }, false);
     let _ = regions;
 }
 
@@ -1824,15 +2017,36 @@ mod tests {
     #[test]
     fn a_default_is_named_after_the_mouse_that_has_the_button() {
         let label = |own: &str, buttons: &[PhysicalButton]| pretty_spec(None, own, buttons, &[]);
-        assert_eq!(label("left", BUTTONS), "Left click (default)");
-        assert_eq!(label("dpi", BUTTONS), "DPI cycle (default)");
+        assert_eq!(label("left", BUTTONS), "左键 (默认)");
+        assert_eq!(label("dpi", BUTTONS), "DPI 循环切换 (默认)");
         // The Basilisk V3 (issue 5): functions without a config value still get one name.
-        assert_eq!(label("dpi", BASILISK_V3_BUTTONS), "DPI cycle (default)");
-        assert_eq!(label("scroll-mode", BASILISK_V3_BUTTONS), "Scroll mode (default)");
-        assert_eq!(label("tilt-left", BASILISK_V3_BUTTONS), "Scroll left (default)");
-        assert_eq!(label("tilt-right", BASILISK_V3_BUTTONS), "Scroll right (default)");
-        assert_eq!(label("clutch", BASILISK_V3_BUTTONS), "Sensitivity clutch 400 DPI (default)");
-        assert_eq!(label("clutch", BASILISK_V2_BUTTONS), "Sensitivity clutch 788 DPI (default)");
-        assert_eq!(pretty_spec(Some("disabled"), "dpi", BASILISK_V3_BUTTONS, &[]), "Disabled");
+        assert_eq!(label("dpi", BASILISK_V3_BUTTONS), "DPI 循环切换 (默认)");
+        assert_eq!(label("scroll-mode", BASILISK_V3_BUTTONS), "滚轮模式切换 (默认)");
+        assert_eq!(label("tilt-left", BASILISK_V3_BUTTONS), "向左滚动 (默认)");
+        assert_eq!(label("tilt-right", BASILISK_V3_BUTTONS), "向右滚动 (默认)");
+        assert_eq!(label("clutch", BASILISK_V3_BUTTONS), "灵敏度离合 400 DPI (默认)");
+        assert_eq!(label("clutch", BASILISK_V2_BUTTONS), "灵敏度离合 788 DPI (默认)");
+        assert_eq!(pretty_spec(Some("disabled"), "dpi", BASILISK_V3_BUTTONS, &[]), "已禁用");
+    }
+
+    #[test]
+    fn shortcut_presets_round_trip_onboard() {
+        for (label, spec) in SHORTCUT_PRESETS {
+            let f = parse_button(spec).expect(spec).expect(spec);
+            assert_eq!(crate::config::spec_for(&f).as_deref(), Some(spec), "canonical spec mismatch for {label}");
+            assert_eq!(category_of(Some(spec), &[]), CAT_SHORTCUT, "{label}");
+        }
+        assert_eq!(category_of(Some("key:win+shift+s"), &[]), CAT_SHORTCUT);
+        assert_eq!(pretty_spec(Some("key:win+d"), "forward", BUTTONS, &[]), "快捷：显示桌面 (Win + D)");
+        assert_eq!(category_of(Some("key:f5"), &[]), CAT_KEYBOARD);
+    }
+
+    #[test]
+    fn chinese_text_macro_summary_truncates_on_char_boundary() {
+        let m = MacroConfig { id: 1, name: "中文短语".into(), events: vec![format!("text:{}", "中".repeat(30))] };
+        let desc = macros::describe(&m.events().unwrap());
+        assert!(desc.len() > 70 && !desc.is_char_boundary(67));
+        let out = truncate_summary(desc, 70);
+        assert!(out.ends_with("...") && out.len() <= 70 && out.contains('中'));
     }
 }

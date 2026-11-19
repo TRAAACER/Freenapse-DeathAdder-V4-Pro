@@ -12,7 +12,8 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -47,8 +48,64 @@ const ID_OPEN_CONFIG: usize = 3;
 const ID_REFRESH: usize = 4;
 const ID_SETTINGS: usize = 5;
 const ID_UPDATE: usize = 6;
+const ID_AUTOSTART: usize = 7;
+const ID_ONBOARD_ONLY: usize = 8;
 const ID_STAGE_BASE: usize = 100;
 const ID_POLL_BASE: usize = 200;
+
+const RETRY_BASE_MS: u32 = 1200;
+const RETRY_MAX_MS: u32 = 4800;
+
+/// Pure per-game profile state machine, separated from Win32/HID for deterministic testing.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct GameSync {
+    /// Game profile confirmed written in full to the hardware (`None` = base layout confirmed).
+    applied: Option<String>,
+    /// True while hardware may hold a partial/unconfirmed game layout, or right after base `apply()` ran.
+    dirty: bool,
+    /// User's DPI stage before the first game DPI override took effect; restored when leaving DPI-overridden games.
+    stage_before_game: Option<u8>,
+    /// Consecutive transient `GetForegroundWindow() == 0` checks (bounded to 3 before treating as desktop).
+    fg_empty_retries: u8,
+}
+
+impl GameSync {
+    fn on_base_applied(&mut self, has_rules: bool) {
+        self.applied = None;
+        self.dirty = has_rules;
+    }
+
+    fn needs_sync(&self, wanted: &Option<String>) -> bool {
+        self.dirty || *wanted != self.applied
+    }
+
+    fn begin_sync(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Decide which 1-based DPI stage to write (`None` = leave DPI stage untouched),
+    /// persistently recording `stage_before_game` before the first game DPI override.
+    fn plan_dpi_stage(&mut self, game_stage: Option<u8>, has_game: bool, current_active: u8) -> Option<u8> {
+        match game_stage {
+            Some(s) => {
+                if self.stage_before_game.is_none() {
+                    self.stage_before_game = Some(current_active);
+                }
+                Some(s)
+            }
+            None if has_game => None,
+            None => self.stage_before_game,
+        }
+    }
+
+    fn commit_sync(&mut self, wanted: Option<String>) {
+        if wanted.is_none() {
+            self.stage_before_game = None;
+        }
+        self.applied = wanted;
+        self.dirty = false;
+    }
+}
 
 struct App {
     hwnd: HWND,
@@ -57,6 +114,7 @@ struct App {
     config: Config,
     config_error: Option<String>,
     mouse: Option<Mouse>,
+    onboard_macros: bool,
     battery: Option<Battery>,
     stages: Option<DpiStages>,
     polling: Option<u16>,
@@ -65,12 +123,7 @@ struct App {
     need_import: bool,
     /// The file `config` was loaded from: another mouse has another file.
     config_file: std::path::PathBuf,
-    /// Game whose profile is currently written to the mouse (its `GameOverrides::key`), if any.
-    game_mode: Option<String>,
-    /// Game profile that should be on the mouse but could not be written yet (mouse asleep).
-    game_wanted: Option<Option<String>>,
-    /// The DPI stage the mouse was on before a game's profile changed it; put back when the game goes away.
-    stage_before_game: Option<u8>,
+    game: GameSync,
     notified_low: bool,
     last_error: Option<String>,
     last_refresh: Option<Instant>,
@@ -82,7 +135,16 @@ struct App {
     /// A newer release on GitHub (version without the `v`), shown in the menu and tooltip.
     update_tag: Option<String>,
     notified_update: bool,
+    /// Out-of-context WinEvent hooks (`EVENT_SYSTEM_FOREGROUND`, `EVENT_SYSTEM_MINIMIZEEND`), installed only when game rules exist.
+    fg_hooks: [HWINEVENTHOOK; 2],
+    /// Current `TIMER_RETRY` period (`0` = disarmed) and tick counter for bounded idle probing.
+    retry_ms: u32,
+    retry_ticks: u32,
+    /// Current `TIMER_POLL` period in seconds.
+    poll_secs: u32,
 }
+
+static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -135,8 +197,8 @@ pub fn run(open_settings: bool) {
             }
         };
 
-        load_soft_macros(&config);
-        install_hook();
+        load_soft_macros(&config, None, true);
+        let poll_secs = config.tray.poll_seconds.max(5);
         let app = Box::new(App {
             hwnd: 0,
             nid: mem::zeroed(),
@@ -144,15 +206,14 @@ pub fn run(open_settings: bool) {
             config,
             config_error,
             mouse: None,
+            onboard_macros: true,
             battery: None,
             stages: None,
             polling: None,
             config_applied: false,
             need_import,
             config_file: config_path(),
-            game_mode: None,
-            game_wanted: None,
-            stage_before_game: None,
+            game: GameSync::default(),
             notified_low: false,
             last_error: None,
             last_refresh: None,
@@ -161,6 +222,10 @@ pub fn run(open_settings: bool) {
             config_mtime: None,
             update_tag: None,
             notified_update: false,
+            fg_hooks: [0, 0],
+            retry_ms: 0,
+            retry_ticks: 0,
+            poll_secs,
         });
         let app_ptr = Box::into_raw(app);
 
@@ -195,15 +260,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let app = (*cs).lpCreateParams as *mut App;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
             (*app).hwnd = hwnd;
+            TRAY_HWND.store(hwnd, Ordering::Relaxed);
             // Let TaskbarCreated through even if the process runs elevated.
             ChangeWindowMessageFilterEx(hwnd, (*app).taskbar_created, MSGFLT_ALLOW, ptr::null_mut());
             (*app).add_icon();
-            (*app).refresh();
             (*app).repair_autostart();
-            let poll_ms = (*app).config.tray.poll_seconds.max(5) * 1000;
+            (*app).refresh();
+            (*app).sync_fg_hooks();
+            (*app).check_game();
+            (*app).sync_retry_timer();
+            let poll_ms = (*app).poll_secs * 1000;
             SetTimer(hwnd, TIMER_POLL, poll_ms, None);
-            SetTimer(hwnd, TIMER_GAME, 2000, None);
-            SetTimer(hwnd, TIMER_RETRY, 5000, None);
             // Reconnect the moment the dongle is plugged in or the PC wakes, instead of at the next poll.
             register_device_notifications(hwnd);
             register_resume_notifications(hwnd);
@@ -224,14 +291,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             match wparam {
                 TIMER_POLL => {
                     (*app).refresh();
-                    (*app).repair_autostart();
-                }
-                TIMER_GAME => (*app).check_game(),
-                TIMER_RETRY => {
-                    // Settings could not be written while the mouse was asleep: try again once it moves.
-                    if ((*app).need_import || !(*app).config_applied || (*app).battery.is_none()) && user_active() {
-                        (*app).refresh();
+                    if (*app).game.dirty {
+                        (*app).check_game();
                     }
+                    (*app).sync_retry_timer();
+                }
+                TIMER_GAME => {
+                    KillTimer(hwnd, TIMER_GAME);
+                    (*app).check_game();
+                    (*app).sync_retry_timer();
+                }
+                TIMER_RETRY => {
+                    (*app).retry_ticks = (*app).retry_ticks.wrapping_add(1);
+                    // RETRY_BASE_MS (1200 ms) < user_active() (1500 ms) so mouse wakes are never missed;
+                    // every 4th tick also probes once in case the mouse was already awake without cursor motion.
+                    if user_active() || (*app).retry_ticks.is_multiple_of(4) {
+                        let need_base = (*app).need_import || (!(*app).config_applied && (*app).config_error.is_none()) || (*app).battery.is_none();
+                        if need_base {
+                            (*app).refresh();
+                        }
+                        if (*app).game.dirty {
+                            (*app).check_game();
+                        }
+                    }
+                    (*app).sync_retry_timer();
                 }
                 TIMER_REPLUG => {
                     KillTimer(hwnd, TIMER_REPLUG);
@@ -240,6 +323,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     (*app).battery = None;
                     (*app).refresh();
                     (*app).check_game();
+                    (*app).sync_retry_timer();
                 }
                 TIMER_CONFIG => {
                     KillTimer(hwnd, TIMER_CONFIG);
@@ -275,8 +359,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             1
         }
         WM_DESTROY => {
+            TRAY_HWND.store(0, Ordering::Relaxed);
+            apply_active_soft_mask(0);
             let app = app_from(hwnd);
             if !app.is_null() {
+                (*app).unhook_fg();
                 Shell_NotifyIconW(NIM_DELETE, &(*app).nid);
                 if (*app).hicon != 0 {
                     DestroyIcon((*app).hicon);
@@ -312,17 +399,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Err(e) => (*app).config_error = Some(e),
                     }
-                    load_soft_macros(&(*app).config);
+                    load_soft_macros(&(*app).config, (*app).game.applied.as_deref(), (*app).onboard_macros);
+                    (*app).sync_poll_timer();
+                    (*app).sync_fg_hooks();
                     if let Some(m) = (*app).mouse.as_mut() {
                         m.set_write_access(&(*app).config);
                     }
                     (*app).note_config_mtime();
                     (*app).config_applied = wparam == 1;
                     // The config (and the mouse) now hold the base layout; a running game is re-detected.
-                    (*app).game_mode = None;
-                    (*app).game_wanted = None;
+                    (*app).game.on_base_applied((*app).has_game_rules());
                     (*app).refresh();
                     (*app).check_game();
+                    (*app).sync_retry_timer();
                     0
                 }
                 ui::WM_UI_CLOSED => 0,
@@ -338,6 +427,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 (*app).battery = None;
                                 (*app).last_error = Some("mouse unplugged".into());
                                 (*app).update_tray();
+                                (*app).sync_retry_timer();
                             }
                         }
                     }
@@ -377,7 +467,7 @@ impl App {
         self.nid.uCallbackMessage = WM_TRAY;
         self.nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         self.set_icon();
-        copy_wide(&mut self.nid.szTip, "freenapse: connecting...");
+        copy_wide(&mut self.nid.szTip, "Freenapse-DeathAdder V4 Pro：正在连接鼠标...");
         self.show_icon();
     }
 
@@ -413,17 +503,17 @@ impl App {
 
     unsafe fn update_tray(&mut self) {
         self.set_icon();
-        let mut tip = format!("freenapse {}", crate::VERSION);
+        let mut tip = format!("Freenapse-DeathAdder V4 Pro ({})", crate::VERSION);
         match (self.battery, self.mouse.as_ref()) {
             (Some(b), _) => {
                 if b.wired {
-                    tip.push_str("\nWired, no battery");
+                    tip.push_str("\n有线直连（无电池）");
                 } else {
-                    tip.push_str(&format!("\nBattery {}%{}", b.percent, if b.charging { " (charging)" } else { "" }));
+                    tip.push_str(&format!("\n电量 {}%{}", b.percent, if b.charging { "（充电中）" } else { "" }));
                 }
             }
-            (None, Some(_)) => tip.push_str("\nMouse asleep: move it to refresh"),
-            (None, None) => tip.push_str("\nMouse not found"),
+            (None, Some(_)) => tip.push_str("\n鼠标休眠中：移动鼠标唤醒"),
+            (None, None) => tip.push_str("\n未检测到鼠标"),
         }
         if let Some(st) = &self.stages {
             if let Some(d) = st.stages.get(st.active.saturating_sub(1) as usize) {
@@ -433,14 +523,17 @@ impl App {
         if let Some(p) = self.polling {
             tip.push_str(&format!("\n{p} Hz"));
         }
-        if let Some(g) = self.game_mode.as_deref().and_then(|k| self.config.game_by_key(k)) {
-            tip.push_str(&format!("\nGame profile: {}", g.name));
+        if let Some(g) = self.game.applied.as_deref().and_then(|k| self.config.game_by_key(k)) {
+            tip.push_str(&format!("\n游戏配置：{}", g.name));
+        }
+        if self.config.tray.onboard_only {
+            tip.push_str("\n纯板载反作弊模式");
         }
         if let Some(e) = &self.config_error {
-            tip.push_str(&format!("\nConfig error: {e}"));
+            tip.push_str(&format!("\n配置文件异常：{e}"));
         }
         if let Some(v) = &self.update_tag {
-            tip.push_str(&format!("\nUpdate {v} available"));
+            tip.push_str(&format!("\n发现新版本 {v}"));
         }
         copy_wide(&mut self.nid.szTip, &tip);
         self.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
@@ -450,11 +543,7 @@ impl App {
     /// Point the "start at login" entry at this executable again when it broke, and say so.
     unsafe fn repair_autostart(&mut self) {
         if crate::autostart::repair() {
-            self.notify(
-                "freenapse starts at login again",
-                "The entry that starts freenapse at login was missing or pointed to another copy of freenapse.exe. It now starts this one.",
-                false,
-            );
+            self.notify("Freenapse-DeathAdder V4 Pro", "检测到开机启动项路径变更，已自动指向当前 freenapse.exe。", false);
         }
     }
 
@@ -472,8 +561,8 @@ impl App {
         self.mouse.as_ref().map(|m| m.spec().polling_rates).unwrap_or(&RATES_HYPERPOLLING)
     }
 
-    fn wanted_polling(&self) -> u16 {
-        self.game_mode.as_deref().and_then(|g| self.config.game_by_key(g)).map(|g| g.polling).unwrap_or(self.config.polling.rate)
+    fn has_game_rules(&self) -> bool {
+        !self.config.games.is_empty() || !self.config.polling.games.is_empty()
     }
 
     /// Reconnect if needed, apply the config once, read battery/DPI/polling.
@@ -500,6 +589,7 @@ impl App {
         }
         struct Read {
             applied: Option<usize>,
+            onboard_macros: Option<bool>,
             battery: Battery,
             stages: Option<DpiStages>,
             polling: Option<u16>,
@@ -511,12 +601,16 @@ impl App {
                     if let Err(e) = Config::write_new(&config_path(), &cfg) {
                         self.config_error = Some(e);
                     }
-                    load_soft_macros(&cfg);
+                    self.onboard_macros = self.mouse.as_ref().and_then(|m| m.macro_support().ok()).unwrap_or(false);
+                    load_soft_macros(&cfg, None, self.onboard_macros);
                     self.config = cfg;
                     self.need_import = false;
                     self.note_config_mtime();
                     self.config_applied = true;
-                    self.notify("freenapse", "Saved the mouse's current settings as your config file", false);
+                    self.game.on_base_applied(self.has_game_rules());
+                    self.sync_poll_timer();
+                    self.sync_fg_hooks();
+                    self.notify("Freenapse-DeathAdder V4 Pro", "已从鼠标板载内存导入初始配置并保存", false);
                 }
                 Err(e) => {
                     self.last_error = Some(e.to_string());
@@ -532,24 +626,30 @@ impl App {
             self.config_applied = true;
         }
         let need_apply = !self.config_applied && self.config_error.is_none();
-        let wanted = self.wanted_polling();
+        let base_polling = self.config.polling.rate;
         let result = {
             let mouse = self.mouse.as_ref().unwrap();
             (|| -> Result<Read, crate::hid::HidError> {
-                let applied = if need_apply { Some(apply::apply(mouse, &self.config, wanted)?.len()) } else { None };
-                Ok(Read { applied, battery: mouse.battery()?, stages: mouse.dpi_stages().ok(), polling: mouse.polling_rate().ok() })
+                let applied = if need_apply { Some(apply::apply(mouse, &self.config, base_polling)?.len()) } else { None };
+                let onboard_macros = mouse.macro_support().ok();
+                Ok(Read { applied, onboard_macros, battery: mouse.battery()?, stages: mouse.dpi_stages().ok(), polling: mouse.polling_rate().ok() })
             })()
         };
         match result {
             Ok(r) => {
+                if let Some(ob) = r.onboard_macros {
+                    self.onboard_macros = ob;
+                }
                 if let Some(n) = r.applied {
                     self.config_applied = true;
-                    // apply() wrote the base layout: a running game's profile is re-applied by check_game.
-                    self.game_mode = None;
-                    self.game_wanted = None;
+                    // Base layout was just written: mark game overlay dirty so check_game re-applies any active game.
+                    self.game.on_base_applied(self.has_game_rules());
+                    update_active_soft_macros(&self.config, None, self.onboard_macros);
                     if n > 0 {
-                        self.notify("freenapse", &format!("Applied {n} setting(s) to the mouse"), false);
+                        self.notify("Freenapse-DeathAdder V4 Pro", &format!("已将 {n} 项配置同步至鼠标板载内存"), false);
                     }
+                } else {
+                    update_active_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
                 }
                 self.battery = Some(r.battery);
                 self.stages = r.stages;
@@ -560,24 +660,29 @@ impl App {
                 let b = r.battery;
                 if !b.wired && !b.charging && b.percent <= low && !self.notified_low {
                     self.notified_low = true;
-                    let name = self.mouse.as_ref().map(|m| m.spec().name.to_string()).unwrap_or_else(|| "Mouse".into());
-                    self.notify("Mouse battery low", &format!("{name} at {}%. Plug it in.", b.percent), true);
+                    let name = self.mouse.as_ref().map(|m| ui::display_model(&m.spec().name)).unwrap_or_else(|| "鼠标".into());
+                    self.notify("鼠标电量过低", &format!("{name} 剩余电量 {}%，请及时充电。", b.percent), true);
                 }
                 if b.charging || b.percent > low + 5 {
                     self.notified_low = false;
                 }
             }
             Err(e) => {
-                self.last_error = Some(e.to_string());
+                let msg = e.to_string();
                 match e {
+                    // Permanent validation / unsupported errors: stop retrying until the config changes.
+                    crate::hid::HidError::Invalid(_) | crate::hid::HidError::Unsupported(_) | crate::hid::HidError::Unverified(_) => {
+                        self.config_error = Some(msg.clone());
+                    }
                     // Device unplugged: drop the handle so the next refresh re-enumerates.
                     crate::hid::HidError::Win32(..) | crate::hid::HidError::NotFound => {
                         self.mouse = None;
                         self.battery = None;
                     }
-                    // Asleep: keep the last known battery value.
+                    // Asleep / transient timeout: keep the last known battery value and retry on wake.
                     _ => {}
                 }
+                self.last_error = Some(msg);
             }
         }
         self.update_tray();
@@ -585,80 +690,135 @@ impl App {
 
     /// Per-game profiles: when a configured game owns the foreground window,
     /// write its polling rate, DPI stage and button layout; restore the base
-    /// config when it goes away. Like Synapse's in-game polling rate and
-    /// per-game profiles, this is done by the tray app.
+    /// config when it goes away.
     unsafe fn check_game(&mut self) {
-        if self.config.games.is_empty() && self.config.polling.games.is_empty() {
+        if !self.has_game_rules() && !self.game.dirty && self.game.applied.is_none() {
+            update_active_soft_macros(&self.config, None, self.onboard_macros);
             return;
         }
-        let path = foreground_path().unwrap_or_default();
-        let game = self.config.game_for(&path).map(|g| g.key);
-        // Keep the mouse's state when nothing changed and nothing is left to write.
-        let wanted = match &self.game_wanted {
-            Some(w) if *w == game => Some(game.clone()),
-            _ if game == self.game_mode => None,
-            _ => Some(game.clone()),
+        let path = match query_foreground() {
+            FgQuery::TransientEmpty if self.game.fg_empty_retries < 3 => {
+                self.game.fg_empty_retries += 1;
+                SetTimer(self.hwnd, TIMER_GAME, 150, None);
+                return;
+            }
+            FgQuery::TransientEmpty => {
+                self.game.fg_empty_retries = 0;
+                String::new()
+            }
+            FgQuery::Window(opt) => {
+                self.game.fg_empty_retries = 0;
+                opt.unwrap_or_default()
+            }
         };
-        let Some(wanted) = wanted else { return };
-        if !user_active() {
-            // The mouse is probably asleep: remember and write once it moves.
-            self.game_wanted = Some(wanted);
+        let wanted = self.config.game_for(&path).map(|g| g.key);
+        // Isolate & cancel disallowed software macros immediately, without waiting for HID writes.
+        update_active_soft_macros(&self.config, wanted.as_deref(), self.onboard_macros);
+
+        if !self.game.needs_sync(&wanted) {
+            return;
+        }
+        self.game.begin_sync();
+        if !user_active() && !self.retry_ticks.is_multiple_of(4) {
             return;
         }
         let Some(mouse) = self.mouse.as_ref() else {
-            self.game_wanted = Some(wanted);
             return;
         };
+        if !mouse.writes_allowed() {
+            self.game.commit_sync(wanted);
+            return;
+        }
+        let over = wanted.as_deref().and_then(|g| self.config.game_by_key(g));
+        let polling = over.as_ref().map(|g| g.polling).unwrap_or(self.config.polling.rate);
         let cfg = &self.config;
-        let over = wanted.as_deref().and_then(|g| cfg.game_by_key(g));
-        let in_game = self.game_mode.is_some();
-        let mut before = self.stage_before_game;
-        // The stage to remember: the one the mouse was on before the first game profile touched it.
-        let result: Result<Option<u8>, crate::hid::HidError> = (|| {
-            let polling = over.as_ref().map(|g| g.polling).unwrap_or(cfg.polling.rate);
-            if mouse.polling_rate().ok() != Some(polling) {
+        let game = &mut self.game;
+        let result: Result<(), crate::hid::HidError> = (|| {
+            if mouse.polling_rate()? != polling {
                 mouse.set_polling_rate(polling)?;
             }
             let st = mouse.dpi_stages()?;
-            // A game's stage replaces the one picked with the DPI button; when no game is left,
-            // that one comes back. A game without a stage of its own leaves the stage alone.
-            let stage = match over.as_ref().and_then(|g| g.dpi_stage) {
-                Some(s) => {
-                    if !in_game {
-                        before = Some(st.active);
-                    }
-                    Some(s)
-                }
-                None if over.is_some() => None,
-                None => before.take(),
-            };
+            let stage = game.plan_dpi_stage(over.as_ref().and_then(|g| g.dpi_stage), over.is_some(), st.active);
             if let Some(stage) = stage.filter(|s| *s != st.active && (1..=st.stages.len() as u8).contains(s)) {
                 mouse.set_dpi_stages(stage, &st.stages)?;
             }
             apply::apply_game_buttons(mouse, cfg, over.as_ref())?;
-            Ok(before)
+            Ok(())
         })();
         match result {
-            Ok(before) => {
-                self.stage_before_game = before;
-                self.game_mode = wanted;
-                self.game_wanted = None;
+            Ok(()) => {
+                self.game.commit_sync(wanted);
                 self.polling = mouse.polling_rate().ok();
                 self.stages = mouse.dpi_stages().ok();
+                self.last_error = None;
                 self.update_tray();
             }
             Err(e) => {
                 self.last_error = Some(e.to_string());
-                self.game_wanted = Some(wanted);
             }
         }
     }
 
-    /// Remember when the config file was last written by us or loaded, so an
-    /// edit by hand can be told apart from the settings window's own save.
-    /// A different mouse is open: drive it with its own config file (made from
-    /// the mouse's settings the first time), never with the previous mouse's.
-    fn switch_config(&mut self) {
+    /// Subscribe to out-of-context foreground window events (`WINEVENT_OUTOFCONTEXT`, including our own
+    /// settings window so clicking directly from a game into freenapse exits game mode cleanly).
+    unsafe fn sync_fg_hooks(&mut self) {
+        if self.has_game_rules() {
+            if self.fg_hooks[0] == 0 {
+                self.fg_hooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT);
+            }
+            if self.fg_hooks[1] == 0 {
+                self.fg_hooks[1] = SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND, 0, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT);
+            }
+        } else {
+            self.unhook_fg();
+        }
+    }
+
+    unsafe fn unhook_fg(&mut self) {
+        for h in &mut self.fg_hooks {
+            if *h != 0 {
+                UnhookWinEvent(*h);
+                *h = 0;
+            }
+        }
+        if self.hwnd != 0 {
+            KillTimer(self.hwnd, TIMER_GAME);
+        }
+    }
+
+    unsafe fn sync_poll_timer(&mut self) {
+        let want = self.config.tray.poll_seconds.max(5);
+        if want != self.poll_secs && self.hwnd != 0 {
+            if SetTimer(self.hwnd, TIMER_POLL, want * 1000, None) != 0 {
+                self.poll_secs = want;
+            }
+        }
+    }
+
+    /// Arm the wake-up retry timer with bounded backoff (`1200..=4800 ms`) only while transient work is pending.
+    unsafe fn sync_retry_timer(&mut self) {
+        let need_base = self.need_import || (!self.config_applied && self.config_error.is_none()) || self.battery.is_none();
+        let need = (need_base || self.game.dirty) && self.config_error.is_none();
+        if need {
+            let next_ms = if self.retry_ms == 0 {
+                RETRY_BASE_MS
+            } else if self.last_error.is_some() {
+                (self.retry_ms * 2).min(RETRY_MAX_MS)
+            } else {
+                RETRY_BASE_MS
+            };
+            if next_ms != self.retry_ms && SetTimer(self.hwnd, TIMER_RETRY, next_ms, None) != 0 {
+                self.retry_ms = next_ms;
+            }
+        } else if self.retry_ms != 0 {
+            KillTimer(self.hwnd, TIMER_RETRY);
+            self.retry_ms = 0;
+            self.retry_ticks = 0;
+        }
+    }
+
+    /// A different mouse is open: drive it with its own config file.
+    unsafe fn switch_config(&mut self) {
         self.config_file = config_path();
         self.need_import = !self.config_file.exists();
         let (config, err) = if self.need_import {
@@ -671,10 +831,11 @@ impl App {
         };
         self.config = config;
         self.config_error = err;
-        load_soft_macros(&self.config);
+        load_soft_macros(&self.config, None, self.onboard_macros);
+        self.sync_poll_timer();
+        self.sync_fg_hooks();
         self.config_applied = false;
-        self.game_mode = None;
-        self.game_wanted = None;
+        self.game = GameSync::default();
         self.note_config_mtime();
     }
 
@@ -705,14 +866,16 @@ impl App {
                 return;
             }
         }
-        load_soft_macros(&self.config);
+        load_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
+        self.sync_poll_timer();
+        self.sync_fg_hooks();
         self.config_applied = false;
-        self.game_mode = None;
-        self.game_wanted = None;
+        self.game.on_base_applied(self.has_game_rules());
         self.refresh();
         self.check_game();
+        self.sync_retry_timer();
         if self.config_applied {
-            self.notify("freenapse", "Config file changed: written to the mouse", false);
+            self.notify("Freenapse-DeathAdder V4 Pro", "检测到配置文件修改：已自动写入鼠标", false);
         }
     }
 
@@ -724,7 +887,7 @@ impl App {
         }
         if !self.notified_update {
             self.notified_update = true;
-            self.notify("freenapse update", &format!("Version {v} is available. The tray menu has the link."), false);
+            self.notify("发现上游新版本", &format!("上游版本 {v} 已发布，可在托盘右键菜单查看。"), false);
         }
         self.update_tag = Some(v);
         self.update_tray();
@@ -733,10 +896,10 @@ impl App {
     unsafe fn show_menu(&mut self) {
         let menu = CreatePopupMenu();
         let status = match (self.battery, self.mouse.as_ref()) {
-            (Some(b), _) if b.wired => "Wired, no battery".to_string(),
-            (Some(b), _) => format!("Battery {}%{}", b.percent, if b.charging { " (charging)" } else { "" }),
-            (None, Some(_)) => "Mouse asleep - move it".to_string(),
-            (None, None) => "Mouse not found".to_string(),
+            (Some(b), _) if b.wired => "有线供电（无内置电池）".to_string(),
+            (Some(b), _) => format!("当前电量 {}%{}", b.percent, if b.charging { "（充电中）" } else { "" }),
+            (None, Some(_)) => "鼠标已休眠（移动唤醒）".to_string(),
+            (None, None) => "未检测到鼠标".to_string(),
         };
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(&status).as_ptr());
         if let Some(e) = &self.last_error {
@@ -745,7 +908,7 @@ impl App {
             }
         }
         if let Some(v) = &self.update_tag {
-            AppendMenuW(menu, MF_STRING, ID_UPDATE, wide(&format!("Update to freenapse {v}...")).as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_UPDATE, wide(&format!("查看上游版本 {v}...")).as_ptr());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
@@ -753,20 +916,24 @@ impl App {
         let active = self.stages.as_ref().map(|s| s.active).unwrap_or(self.config.dpi.active);
         for (i, (x, _)) in stages.iter().enumerate() {
             let checked = if i + 1 == active as usize { MF_CHECKED } else { 0 };
-            AppendMenuW(menu, MF_STRING | checked, ID_STAGE_BASE + i, wide(&format!("DPI {x}")).as_ptr());
+            AppendMenuW(menu, MF_STRING | checked, ID_STAGE_BASE + i, wide(&format!("DPI 档位 {}：{x}", i + 1)).as_ptr());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         for (i, hz) in self.rates().iter().enumerate() {
             let checked = if Some(*hz) == self.polling { MF_CHECKED } else { 0 };
-            AppendMenuW(menu, MF_STRING | checked, ID_POLL_BASE + i, wide(&format!("{hz} Hz")).as_ptr());
+            AppendMenuW(menu, MF_STRING | checked, ID_POLL_BASE + i, wide(&format!("回报率 {hz} Hz")).as_ptr());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("Settings...").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("Refresh").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_APPLY, wide("Re-apply config").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, wide("Open config file").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("打开控制中心...").as_ptr());
+        let auto_chk = if crate::autostart::is_enabled() { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, MF_STRING | auto_chk, ID_AUTOSTART, wide("开机静默自启").as_ptr());
+        let ob_chk = if self.config.tray.onboard_only { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, MF_STRING | ob_chk, ID_ONBOARD_ONLY, wide("纯板载反作弊模式").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("立即刷新状态").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_APPLY, wide("重新写入配置").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, wide("打开配置文件").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_QUIT, wide("Quit").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_QUIT, wide("退出托盘").as_ptr());
 
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
@@ -787,6 +954,29 @@ impl App {
             ID_SETTINGS => {
                 ui::open(self.hwnd);
             }
+            ID_AUTOSTART => {
+                let want = !crate::autostart::is_enabled();
+                if let Err(e) = crate::autostart::set(want) {
+                    self.notify("Freenapse-DeathAdder V4 Pro", &format!("设置开机自启失败：{e}"), true);
+                }
+            }
+            ID_ONBOARD_ONLY => {
+                self.config.tray.onboard_only = !self.config.tray.onboard_only;
+                if let Err(e) = Config::write_new(&config_path(), &self.config) {
+                    self.notify("Freenapse-DeathAdder V4 Pro", &format!("保存配置失败：{e}"), true);
+                }
+                self.note_config_mtime();
+                update_active_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
+                if !self.config.soft_macro_slots().is_empty() {
+                    self.config_applied = false;
+                    self.game.on_base_applied(self.has_game_rules());
+                    self.refresh();
+                    self.check_game();
+                    self.sync_retry_timer();
+                } else {
+                    self.update_tray();
+                }
+            }
             ID_UPDATE => {
                 ShellExecuteW(0, wide("open").as_ptr(), wide(crate::update::RELEASES_URL).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
             }
@@ -798,10 +988,15 @@ impl App {
                     }
                     Err(e) => self.config_error = Some(e),
                 }
-                load_soft_macros(&self.config);
+                load_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
+                self.sync_poll_timer();
+                self.sync_fg_hooks();
                 self.note_config_mtime();
                 self.config_applied = false;
+                self.game.on_base_applied(self.has_game_rules());
                 self.refresh();
+                self.check_game();
+                self.sync_retry_timer();
             }
             ID_OPEN_CONFIG => {
                 let path = config_path();
@@ -838,29 +1033,48 @@ impl App {
     }
 }
 
-/// Full path of the executable owning the foreground window.
-unsafe fn foreground_path() -> Option<String> {
+/// Out-of-context foreground / un-minimize notification: zero DLL injection, zero polling.
+unsafe extern "system" fn win_event_proc(_hook: HWINEVENTHOOK, _event: u32, _hwnd: HWND, id_object: i32, _id_child: i32, _thread: u32, _time: u32) {
+    if id_object != OBJID_WINDOW {
+        return;
+    }
+    let tray = TRAY_HWND.load(Ordering::Relaxed);
+    if tray != 0 {
+        // 120 ms one-shot debounce: switches almost instantly while coalescing rapid Alt+Tab hops.
+        SetTimer(tray, TIMER_GAME, 120, None);
+    }
+}
+
+enum FgQuery {
+    /// `GetForegroundWindow()` returned 0 transiently during a focus / fullscreen switch.
+    TransientEmpty,
+    /// Foreground window exists (`Some(path)` when readable, `None` when protected system process).
+    Window(Option<String>),
+}
+
+/// Query the executable owning the foreground window without requesting VM/debug rights.
+unsafe fn query_foreground() -> FgQuery {
     let hwnd = GetForegroundWindow();
     if hwnd == 0 {
-        return None;
+        return FgQuery::TransientEmpty;
     }
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
     if pid == 0 {
-        return None;
+        return FgQuery::TransientEmpty;
     }
     let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
     if h == 0 {
-        return None;
+        return FgQuery::Window(None);
     }
     let mut buf = [0u16; 1024];
     let mut len = buf.len() as u32;
     let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
     CloseHandle(h);
     if ok == 0 {
-        return None;
+        return FgQuery::Window(None);
     }
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
+    FgQuery::Window(Some(String::from_utf16_lossy(&buf[..len as usize])))
 }
 
 // ---------------------------------------------------------------------------
@@ -947,7 +1161,7 @@ fn check_updates(hwnd: HWND) {
 // keyboard hook swallows that key and plays the macro's events.
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::macros::{Event, Playback};
@@ -956,17 +1170,22 @@ use crate::player;
 struct SoftSlot {
     events: Arc<Vec<Event>>,
     play: Playback,
-    /// Flag of the playback loop in progress ("while held" / toggle); set to stop it.
+    /// Flag of the playback loop in progress ("while held" / toggle / times / sequence); set to stop it.
     stop: Mutex<Arc<AtomicBool>>,
+    /// Serializes runs on this slot so a cancelled run releases held keys/buttons before a new one starts.
+    run_lock: Mutex<()>,
     running: AtomicBool,
     down: AtomicBool,
     seq: AtomicUsize,
 }
 
 static SOFT: Mutex<Vec<Arc<SoftSlot>>> = Mutex::new(Vec::new());
+static ACTIVE_SOFT_MASK: AtomicU16 = AtomicU16::new(0);
+static HOOK_STATE: Mutex<Option<(u32, std::thread::JoinHandle<()>)>> = Mutex::new(None);
 
-/// Rebuild the slot table from the config (slot i = key F13 + i, same order as `Config::soft_macro_slots`).
-fn load_soft_macros(cfg: &Config) {
+/// Rebuild the slot table from the config (slot i = key F13 + i, same order as `Config::soft_macro_slots`),
+/// then activate only the slots permitted in the current foreground profile.
+fn load_soft_macros(cfg: &Config, game_key: Option<&str>, onboard_macros: bool) {
     let slots: Vec<Arc<SoftSlot>> = cfg
         .soft_macro_slots()
         .into_iter()
@@ -976,32 +1195,85 @@ fn load_soft_macros(cfg: &Config) {
                 events: Arc::new(events),
                 play,
                 stop: Mutex::new(Arc::new(AtomicBool::new(false))),
+                run_lock: Mutex::new(()),
                 running: AtomicBool::new(false),
                 down: AtomicBool::new(false),
                 seq: AtomicUsize::new(0),
             })
         })
         .collect();
-    let mut table = SOFT.lock().unwrap_or_else(|e| e.into_inner());
-    for s in table.iter() {
-        s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
+    {
+        let mut table = SOFT.lock().unwrap_or_else(|e| e.into_inner());
+        for s in table.iter() {
+            s.running.store(false, Ordering::Relaxed);
+            s.down.store(false, Ordering::Relaxed);
+            s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
+        }
+        *table = slots;
     }
-    *table = slots;
+    update_active_soft_macros(cfg, game_key, onboard_macros);
 }
 
-/// The low-level keyboard hook gets a thread of its own: Windows calls it for
-/// every key press system-wide and waits for it, so it must never sit behind
-/// the tray's device reads (up to a second each while the mouse sleeps).
-/// Windows also silently removes a hook that keeps timing out.
-unsafe fn install_hook() {
-    std::thread::spawn(|| unsafe {
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(ptr::null()), 0);
-        let mut msg: MSG = mem::zeroed();
-        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+/// Recompute which software-macro slots are allowed in the current foreground profile
+/// (`None` = desktop, `Some(key)` = active game), cancelling disallowed loops and toggling `WH_KEYBOARD_LL`.
+fn update_active_soft_macros(cfg: &Config, game_key: Option<&str>, onboard_macros: bool) {
+    let mask = cfg.active_soft_slot_mask(game_key, onboard_macros);
+    apply_active_soft_mask(mask);
+}
+
+fn apply_active_soft_mask(mask: u16) {
+    ACTIVE_SOFT_MASK.store(mask, Ordering::Relaxed);
+    {
+        let table = SOFT.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, s) in table.iter().enumerate() {
+            if i >= 12 || (mask & (1u16 << i)) == 0 {
+                s.running.store(false, Ordering::Relaxed);
+                s.down.store(false, Ordering::Relaxed);
+                s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
+            }
         }
-    });
+    }
+    sync_macro_hook(mask != 0);
+}
+
+/// Start the `WH_KEYBOARD_LL` hook thread on demand when `need` is true, and
+/// cleanly `UnhookWindowsHookEx` + join the thread when no software macros are active.
+fn sync_macro_hook(need: bool) {
+    let mut guard = HOOK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if need {
+        if guard.is_none() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<u32, ()>>(1);
+            let handle = std::thread::spawn(move || unsafe {
+                let tid = GetCurrentThreadId();
+                let mut msg: MSG = mem::zeroed();
+                // Ensure the thread message queue exists before publishing `tid` so WM_QUIT never races.
+                PeekMessageW(&mut msg, 0, WM_USER, WM_USER, PM_NOREMOVE);
+                let hhook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(ptr::null()), 0);
+                if hhook == 0 {
+                    let _ = tx.send(Err(()));
+                    return;
+                }
+                if tx.send(Ok(tid)).is_err() {
+                    UnhookWindowsHookEx(hhook);
+                    return;
+                }
+                while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                UnhookWindowsHookEx(hhook);
+            });
+            if let Ok(Ok(tid)) = rx.recv() {
+                *guard = Some((tid, handle));
+            }
+        }
+    } else if let Some((tid, handle)) = guard.take() {
+        let posted = unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) != 0 };
+        drop(guard);
+        if posted {
+            let _ = handle.join();
+        }
+    }
 }
 
 unsafe extern "system" fn kb_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1010,18 +1282,21 @@ unsafe extern "system" fn kb_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
         let own = k.dwExtraInfo == player::INJECT_MARK;
         if !own && (player::VK_F13 as u32..=player::VK_F24 as u32).contains(&k.vkCode) {
             let slot = (k.vkCode - player::VK_F13 as u32) as usize;
+            let down = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
+            let active = slot < 12 && (ACTIVE_SOFT_MASK.load(Ordering::Relaxed) & (1u16 << slot)) != 0;
             let s = SOFT.lock().ok().and_then(|t| t.get(slot).cloned());
             if let Some(s) = s {
-                let down = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
-                soft_trigger(&s, down);
-                return 1;
+                if active || (!down && s.down.load(Ordering::Relaxed)) {
+                    soft_trigger(&s, down);
+                    return 1;
+                }
             }
         }
     }
     CallNextHookEx(0, code, wparam, lparam)
 }
 
-/// Start a fresh stop flag for a playback loop, ending the previous one.
+/// Start a fresh stop flag for a playback run, ending the previous one.
 fn new_run(s: &SoftSlot) -> Arc<AtomicBool> {
     let mut g = s.stop.lock().unwrap_or_else(|e| e.into_inner());
     g.store(true, Ordering::Relaxed);
@@ -1034,12 +1309,16 @@ fn soft_trigger(s: &Arc<SoftSlot>, down: bool) {
     if down && was_down {
         return; // keyboard auto-repeat of the held key
     }
+    if down && s.events.is_empty() {
+        return;
+    }
     match s.play {
         Playback::Times(n) => {
             if down {
                 let s = s.clone();
                 let stop = new_run(&s);
                 std::thread::spawn(move || {
+                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
                     for _ in 0..n.max(1) {
                         if stop.load(Ordering::Relaxed) {
                             break;
@@ -1054,8 +1333,17 @@ fn soft_trigger(s: &Arc<SoftSlot>, down: bool) {
                 let s = s.clone();
                 let stop = new_run(&s);
                 std::thread::spawn(move || {
+                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if player::has_launch(&s.events) {
+                        player::play(&s.events, &stop);
+                        return;
+                    }
+                    let need_yield = player::loop_needs_yield(&s.events);
                     while !stop.load(Ordering::Relaxed) {
                         player::play(&s.events, &stop);
+                        if need_yield && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
                 });
             } else {
@@ -1073,8 +1361,18 @@ fn soft_trigger(s: &Arc<SoftSlot>, down: bool) {
                 let s = s.clone();
                 let stop = new_run(&s);
                 std::thread::spawn(move || {
+                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if player::has_launch(&s.events) {
+                        player::play(&s.events, &stop);
+                        s.running.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    let need_yield = player::loop_needs_yield(&s.events);
                     while !stop.load(Ordering::Relaxed) {
                         player::play(&s.events, &stop);
+                        if need_yield && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
                     s.running.store(false, Ordering::Relaxed);
                 });
@@ -1088,7 +1386,12 @@ fn soft_trigger(s: &Arc<SoftSlot>, down: bool) {
                 }
                 let k = s.seq.fetch_add(1, Ordering::Relaxed) % steps.len();
                 let step = steps[k].clone();
-                std::thread::spawn(move || player::play(&step, &AtomicBool::new(false)));
+                let s = s.clone();
+                let stop = new_run(&s);
+                std::thread::spawn(move || {
+                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    player::play(&step, &stop);
+                });
             }
         }
     }
@@ -1227,4 +1530,81 @@ unsafe fn canvas_to_icon(c: &Canvas) -> HICON {
     DeleteObject(color);
     DeleteObject(mask);
     icon
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GameSync;
+
+    #[test]
+    fn base_reapply_marks_game_dirty_until_foreground_resynced() {
+        let mut gs = GameSync::default();
+        // Mouse wakes up after initial retry and applies base layout while a game is already in foreground.
+        gs.on_base_applied(true);
+        assert!(gs.dirty, "base apply must keep game sync dirty when game rules exist");
+        assert!(gs.needs_sync(&Some("c:\\games\\shooter".into())));
+        // Even if foreground turns out to be desktop, one check_game pass confirms and clears dirty.
+        assert!(gs.needs_sync(&None));
+        gs.begin_sync();
+        gs.commit_sync(None);
+        assert!(!gs.dirty);
+        assert!(!gs.needs_sync(&None));
+    }
+
+    #[test]
+    fn partial_game_failure_still_restores_base_and_dpi_on_exit() {
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        // Entering a game: polling & DPI stage succeeded (active stage 2 -> 1), then button write failed.
+        let wanted_game = Some("c:\\games\\shooter".to_string());
+        assert!(gs.needs_sync(&wanted_game));
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(Some(1), true, 2), Some(1));
+        assert_eq!(gs.stage_before_game, Some(2));
+        // Notice: commit_sync is NOT called because apply_game_buttons returned Err.
+        assert_eq!(gs.applied, None);
+        assert!(gs.dirty);
+
+        // User Alt+Tabs back to desktop before retry succeeds: must STILL sync and restore stage 2!
+        assert!(gs.needs_sync(&None));
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
+        gs.commit_sync(None);
+        assert_eq!(gs.stage_before_game, None);
+        assert!(!gs.dirty);
+    }
+
+    #[test]
+    fn stage_before_game_survives_across_multiple_games() {
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        // Desktop at stage 2 -> Game A (no DPI override): leave stage untouched, do not clobber stage_before_game.
+        let game_a = Some("game:a".to_string());
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(None, true, 2), None);
+        assert_eq!(gs.stage_before_game, None);
+        gs.commit_sync(game_a);
+
+        // Game A -> Game B (DPI override stage 4): remember original stage 2 and switch to 4.
+        let game_b = Some("game:b".to_string());
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(Some(4), true, 2), Some(4));
+        assert_eq!(gs.stage_before_game, Some(2));
+        gs.commit_sync(game_b);
+
+        // Game B -> Game C (DPI override stage 1): keep original desktop stage 2!
+        let game_c = Some("game:c".to_string());
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(Some(1), true, 4), Some(1));
+        assert_eq!(gs.stage_before_game, Some(2));
+        gs.commit_sync(game_c);
+
+        // Game C -> Desktop: restore stage 2 and clear saved stage.
+        gs.begin_sync();
+        assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
+        gs.commit_sync(None);
+        assert_eq!(gs.stage_before_game, None);
+    }
 }

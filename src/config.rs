@@ -75,6 +75,11 @@ curve = [[0, 1.0], [20, 1.1], [40, 1.2], [70, 1.35], [100, 1.5]]
 [dongle]
 # HyperPolling dongle LED: 1 = battery status, 2 = polling rate, 3 = off.
 led = 1
+# HyperSpeed Gen-2 dome dongle 3 LEDs (left, center, right): "battery", "connection", "polling", "dpi", "off".
+# Empty ([]) leaves the dongle's current LED mapping untouched (e.g. when imported over USB-C).
+leds = []
+# HyperSpeed Gen-2 dome dongle LED brightness: 0..4 (0 = off, 4 = 100%). Omit to keep current.
+# brightness = 4
 
 [profile]
 # Onboard profile that the button and Dynamic Sensitivity settings go to: 1..5 on mice that
@@ -102,9 +107,10 @@ active = 1
 poll_seconds = 60
 # Pop a notification when the battery drops to this percentage.
 notify_percent = 15
-# Once a day, ask GitHub whether a newer release exists and say so in the tray menu. This is the
-# only network request freenapse makes (one GET to api.github.com, nothing about you in it).
-check_updates = true
+# Pure onboard anti-cheat mode: disables software macro hooks (WH_KEYBOARD_LL) and SendInput playback.
+onboard_only = false
+# Disabled by default in Freenapse-DeathAdder V4 Pro.
+check_updates = false
 
 # Lighting, for mice with LEDs (the Basilisk V2: logo and wheel). Zones left out keep their effect.
 # Effects: "off", "spectrum", "static:#rrggbb", "breathing:#rrggbb", "breathing:random".
@@ -327,6 +333,28 @@ pub struct SensorConfig {
 #[serde(default)]
 pub struct DongleConfig {
     pub led: u8,
+    /// Empty (`[]`) means "keep whatever the Gen-2 dome dongle currently stores";
+    /// otherwise must have 3 slot names `[left, center, right]`.
+    pub leds: Vec<String>,
+    /// `None` (omitted) means "keep current brightness"; `Some(0..=4)` sets it.
+    pub brightness: Option<u8>,
+}
+
+impl DongleConfig {
+    pub fn led_codes(&self) -> Result<Option<[u8; 3]>, String> {
+        if self.leds.is_empty() {
+            return Ok(None);
+        }
+        if self.leds.len() != 3 {
+            return Err("dongle.leds must be empty (keep current) or have 3 entries [left, center, right]".into());
+        }
+        let mut out = [0u8; 3];
+        for (i, s) in self.leds.iter().enumerate() {
+            out[i] =
+                crate::device::dongle_led_slot_code(s).ok_or_else(|| format!("dongle.leds[{i}] '{s}' must be battery, connection, polling, dpi or off"))?;
+        }
+        Ok(Some(out))
+    }
 }
 
 /// Which mice freenapse may write to.
@@ -408,6 +436,8 @@ impl UnverifiedAccess {
 pub struct TrayConfig {
     pub poll_seconds: u32,
     pub notify_percent: u8,
+    /// Disables software macro keyboard hooks (`WH_KEYBOARD_LL`) and `SendInput` playback.
+    pub onboard_only: bool,
     /// Ask GitHub once a day whether a newer release exists (the only network request).
     pub check_updates: bool,
 }
@@ -450,12 +480,12 @@ impl Default for SensorConfig {
 }
 impl Default for DongleConfig {
     fn default() -> Self {
-        DongleConfig { led: 1 }
+        DongleConfig { led: 1, leds: Vec::new(), brightness: None }
     }
 }
 impl Default for TrayConfig {
     fn default() -> Self {
-        TrayConfig { poll_seconds: 60, notify_percent: 15, check_updates: true }
+        TrayConfig { poll_seconds: 60, notify_percent: 15, onboard_only: false, check_updates: false }
     }
 }
 
@@ -555,6 +585,12 @@ impl Config {
         }
         if !(1..=3).contains(&self.dongle.led) {
             return Err("dongle.led must be 1, 2 or 3".into());
+        }
+        self.dongle.led_codes()?;
+        if let Some(b) = self.dongle.brightness
+            && b > 4
+        {
+            return Err("dongle.brightness must be 0..4".into());
         }
         if !(1..=5).contains(&self.profile.active) {
             return Err("profile.active must be 1..5".into());
@@ -722,6 +758,71 @@ impl Config {
         slots
     }
 
+    /// Bitmask of `soft_macro_slots()` (`0..MAX_SOFT_SLOTS`) active in the current foreground
+    /// layout (`game_key = None` for desktop, `Some(key)` for an active game profile).
+    /// Returns `0` immediately when `tray.onboard_only` is enabled.
+    pub fn active_soft_slot_mask(&self, game_key: Option<&str>, onboard_macros: bool) -> u16 {
+        if self.tray.onboard_only {
+            return 0;
+        }
+        let slots = self.soft_macro_slots();
+        if slots.is_empty() {
+            return 0;
+        }
+        let over = game_key.and_then(|k| self.game_by_key(k));
+        let mut active_specs: Vec<&str> = Vec::new();
+        let mut has_hypershift = false;
+        for (k, v) in &self.buttons {
+            if k.starts_with("hypershift.") {
+                continue;
+            }
+            let eff = over.as_ref().and_then(|g| g.buttons.get(k)).unwrap_or(v).as_str();
+            if eff == "hypershift" {
+                has_hypershift = true;
+            }
+            active_specs.push(eff);
+        }
+        if let Some(g) = &over {
+            for (k, v) in &g.buttons {
+                if !k.starts_with("hypershift.") && !self.buttons.contains_key(k) {
+                    if v == "hypershift" {
+                        has_hypershift = true;
+                    }
+                    active_specs.push(v.as_str());
+                }
+            }
+        }
+        if has_hypershift {
+            for (k, v) in &self.buttons {
+                if k.starts_with("hypershift.") {
+                    let eff = over.as_ref().and_then(|g| g.buttons.get(k)).unwrap_or(v).as_str();
+                    active_specs.push(eff);
+                }
+            }
+            if let Some(g) = &over {
+                for (k, v) in &g.buttons {
+                    if k.starts_with("hypershift.") && !self.buttons.contains_key(k) {
+                        active_specs.push(v.as_str());
+                    }
+                }
+            }
+        }
+        let mut mask = 0u16;
+        for s in active_specs {
+            if let Some(b) = parse_button(s).ok().flatten().and_then(|f| f.macro_binding()) {
+                let is_soft = !onboard_macros || self.macro_needs_software(b.0);
+                if is_soft {
+                    if let Some(pos) = slots.iter().position(|x| *x == b) {
+                        if pos < crate::macros::MAX_SOFT_SLOTS {
+                            mask |= 1u16 << pos;
+                        }
+                    }
+                }
+            }
+        }
+        mask
+    }
+
     /// The function actually written for a button: macro bindings become the
     /// slot key (F13..F24) when the mouse has no macro memory.
     pub fn resolve_button(&self, f: ButtonFunction, onboard_macros: bool) -> ButtonFunction {
@@ -729,6 +830,9 @@ impl Config {
         let software = f.macro_binding().is_some_and(|(id, _)| self.macro_needs_software(id));
         if onboard_macros && !software {
             return f;
+        }
+        if self.tray.onboard_only && f.macro_binding().is_some() {
+            return ButtonFunction::DISABLED;
         }
         match f.macro_binding() {
             Some(b) => match self.soft_macro_slots().iter().position(|s| *s == b).and_then(crate::macros::soft_key_usage) {
@@ -790,9 +894,12 @@ impl Config {
             ("[acceleration]", "mode", format!("{:?}", self.acceleration.mode)),
             ("[acceleration]", "curve", curve_toml(&self.acceleration.curve)),
             ("[dongle]", "led", self.dongle.led.to_string()),
+            ("[dongle]", "leds", format!("{:?}", self.dongle.leds)),
             ("[profile]", "active", self.profile.active.to_string()),
             ("[tray]", "poll_seconds", self.tray.poll_seconds.to_string()),
             ("[tray]", "notify_percent", self.tray.notify_percent.to_string()),
+            ("[tray]", "onboard_only", self.tray.onboard_only.to_string()),
+            ("[tray]", "check_updates", self.tray.check_updates.to_string()),
         ];
         let mut out = String::new();
         let mut section = String::new();
@@ -804,6 +911,15 @@ impl Config {
                 out.push('\n');
                 if section == "[buttons]" {
                     continue;
+                }
+                continue;
+            }
+            if section == "[dongle]" && t == "# brightness = 4" {
+                if let Some(b) = self.dongle.brightness {
+                    out.push_str(&format!("brightness = {b}\n"));
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
                 }
                 continue;
             }
@@ -1554,5 +1670,57 @@ mod tests {
         c.dpi.y_stages = vec![800, 1200];
         assert_eq!(c.stage_pairs(), vec![(800, 800), (1600, 1200)]);
         assert!(c.xy_split());
+    }
+
+    #[test]
+    fn dongle_keep_and_explicit_roundtrip() {
+        // Default / wired-imported / legacy config leaves Gen-2 dongle fields unset ("keep").
+        let def = Config::default();
+        assert_eq!(def.dongle.led_codes().unwrap(), None);
+        assert_eq!(def.dongle.brightness, None);
+        let reparsed: Config = toml::from_str(&def.render()).unwrap();
+        assert_eq!(reparsed.dongle, def.dongle);
+
+        let legacy: Config = toml::from_str("[dongle]\nled = 2\n").unwrap();
+        assert_eq!(legacy.dongle.led_codes().unwrap(), None);
+        assert_eq!(legacy.dongle.brightness, None);
+
+        // Explicit Gen-2 settings round-trip cleanly and validate length / range.
+        let mut explicit = Config::default();
+        explicit.dongle.leds = vec!["off".into(), "off".into(), "off".into()];
+        explicit.dongle.brightness = Some(1);
+        explicit.validate().unwrap();
+        let back: Config = toml::from_str(&explicit.render()).unwrap();
+        assert_eq!(back.dongle.led_codes().unwrap(), Some([0, 0, 0]));
+        assert_eq!(back.dongle.brightness, Some(1));
+
+        let mut bad_len = Config::default();
+        bad_len.dongle.leds = vec!["battery".into(), "polling".into()];
+        assert!(bad_len.validate().is_err());
+
+        let mut bad_br = Config::default();
+        bad_br.dongle.brightness = Some(5);
+        assert!(bad_br.validate().is_err());
+    }
+
+    #[test]
+    fn active_soft_slots_isolate_per_game_and_onboard_only() {
+        let mut c = Config::default();
+        c.macros.push(MacroConfig { id: 1, name: "Text".into(), events: vec!["text:hi".into()] });
+        c.buttons.insert("back".into(), "macro-toggle:1".into());
+        let mut game = GameConfig { name: "Shooter".into(), dir: "C:\\Games\\Shooter".into(), ..Default::default() };
+        game.buttons.insert("back".into(), "key:r".into());
+        let key = game.key();
+        c.games.push(game);
+
+        // Desktop uses slot 0 (F13); the game profile overrides `back` with onboard `key:r` -> active mask is 0!
+        assert_eq!(c.active_soft_slot_mask(None, false), 0b1);
+        assert_eq!(c.active_soft_slot_mask(Some(&key), false), 0);
+
+        // Pure onboard anti-cheat mode zeroes active software slots everywhere and resolves macro to DISABLED.
+        c.tray.onboard_only = true;
+        assert_eq!(c.active_soft_slot_mask(None, false), 0);
+        let mf = parse_button("macro-toggle:1").unwrap().unwrap();
+        assert_eq!(c.resolve_button(mf, false), ButtonFunction::DISABLED);
     }
 }

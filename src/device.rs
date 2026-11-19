@@ -23,7 +23,7 @@ pub const RATES_HYPERPOLLING: [u16; 7] = [125, 250, 500, 1000, 2000, 4000, 8000]
 pub const RATES_CLASSIC: [u16; 3] = [125, 500, 1000];
 /// What the HyperPolling command carries on a wired link (the Viper Mini SE, per OpenRazer).
 const RATES_HYPERPOLLING_WIRED: [u16; 3] = [125, 500, 1000];
-/// The extended command without 250 Hz: the Viper 8KHz (OpenRazer) and the Mouse Dock Pro.
+/// The Viper 8KHz: the extended command without 250 Hz (OpenRazer).
 const RATES_VIPER_8K: [u16; 6] = [125, 500, 1000, 2000, 4000, 8000];
 
 /// Which polling-rate command a mouse answers.
@@ -33,6 +33,44 @@ pub enum PollingStyle {
     HyperPolling,
     /// `00/05` set, `00/85` get; codes 1000=0x01, 500=0x02, 250=0x04, 125=0x08.
     Classic,
+}
+
+/// Wireless receiver protocol family, deciding how dongle identity and indicator LEDs work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DongleKind {
+    /// Wired link, or standard 1000 Hz HyperSpeed receiver without indicator LED commands.
+    None,
+    /// HyperPolling wireless dongle (0x00C1, 0x00B3): fw 00/81, serial 00/82, single LED 07/10..07/90.
+    HyperPolling,
+    /// HyperSpeed Wireless Gen-2 dome dongle (DeathAdder V4 Pro 0x00BF):
+    /// fw 00/91, serial 00/92, 3 indicator LEDs 07/15..07/95 + brightness 07/16..07/96.
+    Gen2Dome,
+}
+
+/// Indicator functions for each of the 3 LEDs on the HyperSpeed Gen-2 dome dongle.
+pub const DONGLE_LED_SLOTS: [(u8, &str, &str); 5] =
+    [(0x02, "battery", "电量状态"), (0x01, "connection", "连接状态"), (0x03, "polling", "回报率"), (0x04, "dpi", "DPI 档位"), (0x00, "off", "关闭")];
+
+pub fn dongle_led_slot_code(name: &str) -> Option<u8> {
+    let s = name.trim().to_ascii_lowercase();
+    if let Ok(v) = s.parse::<u8>() {
+        if v <= 4 {
+            return Some(v);
+        }
+    }
+    DONGLE_LED_SLOTS.iter().find(|(_, n, _)| *n == s).map(|(c, _, _)| *c)
+}
+
+pub fn dongle_led_slot_name_checked(code: u8) -> Option<&'static str> {
+    DONGLE_LED_SLOTS.iter().find(|(c, _, _)| *c == code).map(|(_, n, _)| *n)
+}
+
+pub fn dongle_led_slot_name(code: u8) -> &'static str {
+    dongle_led_slot_name_checked(code).unwrap_or("off")
+}
+
+pub fn dongle_led_slot_label(code: u8) -> &'static str {
+    DONGLE_LED_SLOTS.iter().find(|(c, _, _)| *c == code).map(|(_, _, l)| *l).unwrap_or("关闭")
 }
 
 /// What freenapse knows about one product id.
@@ -49,6 +87,8 @@ pub struct DeviceSpec {
     pub dpi_max: u16,
     /// The Focus Pro tracking page of `src/sensor.rs` (Smart Tracking / asymmetric cut-off) is known to apply.
     pub sensor_tracking: bool,
+    /// `0b/85` returns `[00, 04, 02, lift-1, land-1, ...]` so asymmetric levels can be read back (DeathAdder V4 Pro).
+    pub asym_readback: bool,
     /// Dynamic Sensitivity commands are available on this row.
     pub supports_acceleration: bool,
     /// Sensor angle commands are available on this row.
@@ -59,8 +99,10 @@ pub struct DeviceSpec {
     pub lighting: &'static [(&'static str, u8)],
     /// Its own config file, `config-<name>.toml`; None shares `config.toml`.
     pub config: Option<&'static str>,
-    /// Dongle pairing (and the dongle indicator LED) as Synapse offers them for the HyperPolling dongle.
+    /// Dongle pairing (and the single dongle indicator LED) as Synapse offers them for the HyperPolling dongle.
     pub pairing: bool,
+    /// Wireless dongle hardware generation for firmware, serial and indicator LEDs.
+    pub dongle: DongleKind,
     /// An owner confirmed writes on this mouse. Until then every write is refused
     /// unless `[device] allow_unverified` in the config names its product id.
     pub verified: bool,
@@ -85,12 +127,14 @@ macro_rules! spec {
             polling_rates: &$rates,
             dpi_max: $dpi,
             sensor_tracking: $s,
+            asym_readback: false,
             supports_acceleration: $a,
             supports_rotation: $r,
             battery: true,
             lighting: &[],
             config: None,
             pairing: $p,
+            dongle: if $p { DongleKind::HyperPolling } else { DongleKind::None },
             verified: $v,
             buttons: $b,
         }
@@ -114,8 +158,18 @@ pub const DEVICES: &[DeviceSpec] = &[
     spec!(0x00DE, "Razer Viper V3 Pro SE (wired)", wireless false, tid 0x1f, Classic, RATES_CLASSIC, dpi 35000, sensor false, pairing false, verified true),
     spec!(0x00DF, "Razer Viper V3 Pro SE (wireless)", wireless true, tid 0x1f, Classic, RATES_CLASSIC, dpi 35000, sensor false, pairing false, verified true),
     spec!(0x00B3, "Razer HyperPolling wireless dongle", wireless true, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 30000, sensor false, pairing true, verified false),
-    spec!(0x00BE, "Razer DeathAdder V4 Pro (wired)", wireless false, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 45000, sensor false, pairing false, verified false),
-    spec!(0x00BF, "Razer DeathAdder V4 Pro (wireless)", wireless true, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 45000, sensor false, pairing true, verified false),
+    // DeathAdder V4 Pro (wired 0x00BE, wireless Gen-2 dome dongle 0x00BF): verified up to 45000 DPI,
+    // 8000 Hz HyperPolling, Focus Pro 45K tracking (Smart + Asymmetric readback), rotation, Dynamic Sensitivity,
+    // all 8 buttons (Normal + Hypershift) and the Gen-2 dome dongle's 3-LED indicators (07/15..07/95).
+    DeviceSpec {
+        asym_readback: true,
+        ..spec!(0x00BE, "Razer DeathAdder V4 Pro (wired)", wireless false, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 45000, sensor true, pairing false, verified true)
+    },
+    DeviceSpec {
+        asym_readback: true,
+        dongle: DongleKind::Gen2Dome,
+        ..spec!(0x00BF, "Razer DeathAdder V4 Pro (wireless)", wireless true, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 45000, sensor true, pairing false, verified true)
+    },
     spec!(0x00B6, "Razer DeathAdder V3 Pro (wired)", wireless false, tid 0x1f, Classic, RATES_CLASSIC, dpi 30000, sensor false, pairing false, verified false, acceleration false, rotation false),
     spec!(0x00B7, "Razer DeathAdder V3 Pro (wireless)", wireless true, tid 0x1f, Classic, RATES_CLASSIC, dpi 35000, sensor false, pairing false, verified false),
     spec!(0x00B2, "Razer DeathAdder V3", wireless false, tid 0x1f, HyperPolling, RATES_HYPERPOLLING, dpi 30000, sensor false, pairing false, verified false),
@@ -153,29 +207,8 @@ pub const DEVICES: &[DeviceSpec] = &[
         config: Some("basilisk-v3"),
         ..spec!(0x0099, "Razer Basilisk V3", wireless false, tid 0x1f, Classic, RATES_CLASSIC, dpi 26000, sensor false, pairing false, verified true, acceleration false, rotation false, buttons BASILISK_V3_BUTTONS)
     },
-    // The Basilisk V3 Pro, from its owner's probes over the cable and through the Mouse Dock Pro
-    // (issue 9, firmware 3.0): a battery, the Basilisk V3's 13 buttons with the same defaults, angle and
-    // Dynamic Sensitivity refused, macro memory, five onboard profiles. One config file for the three links.
-    // That owner confirmed DPI, polling and button writes over the cable and through the dock (4000 Hz
-    // read back; 8000 Hz, macros and profile switching were not tried); the HyperSpeed dongle row is
-    // still unverified. Its LEDs are not listed: nobody has probed their commands.
-    DeviceSpec {
-        config: Some("basilisk-v3-pro"),
-        ..spec!(0x00AA, "Razer Basilisk V3 Pro (wired)", wireless false, tid 0x1f, Classic, RATES_CLASSIC, dpi 30000, sensor false, pairing false, verified true, acceleration false, rotation false, buttons BASILISK_V3_BUTTONS)
-    },
-    // Through the HyperSpeed dongle: not probed, polling command from OpenRazer.
-    DeviceSpec {
-        config: Some("basilisk-v3-pro"),
-        ..spec!(0x00AB, "Razer Basilisk V3 Pro (wireless)", wireless true, tid 0x1f, Classic, RATES_CLASSIC, dpi 30000, sensor false, pairing false, verified false, acceleration false, rotation false, buttons BASILISK_V3_BUTTONS)
-    },
-    // The Mouse Dock Pro's own product id (its paired list names the mouse, 0x00AB): the probe
-    // answered the HyperPolling getter and refused the classic one. Its owner set 4000 Hz and read it
-    // back; 8000 Hz is Razer's specification for the dock, not yet tried. The dock answers the paired
-    // list, but pairing and its LED were not tried, so they stay off.
-    DeviceSpec {
-        config: Some("basilisk-v3-pro"),
-        ..spec!(0x00A4, "Razer Basilisk V3 Pro (Mouse Dock Pro)", wireless true, tid 0x1f, HyperPolling, RATES_VIPER_8K, dpi 30000, sensor false, pairing false, verified true, acceleration false, rotation false, buttons BASILISK_V3_BUTTONS)
-    },
+    spec!(0x00AA, "Razer Basilisk V3 Pro (wired)", wireless false, tid 0x1f, Classic, RATES_CLASSIC, dpi 30000, sensor false, pairing false, verified false),
+    spec!(0x00AB, "Razer Basilisk V3 Pro (wireless)", wireless true, tid 0x1f, Classic, RATES_CLASSIC, dpi 30000, sensor false, pairing false, verified false),
 ];
 
 impl DeviceSpec {
@@ -214,15 +247,22 @@ impl DeviceSpec {
             polling_rates: &RATES_CLASSIC,
             dpi_max: 30000,
             sensor_tracking: false,
+            asym_readback: false,
             supports_acceleration: true,
             supports_rotation: true,
             battery: true,
             lighting: &[],
             config: None,
             pairing: false,
+            dongle: DongleKind::None,
             verified: false,
             buttons: BUTTONS,
         }
+    }
+
+    /// True for right-handed ergonomic shells (DeathAdder, Basilisk, Pro Click).
+    pub fn is_ergonomic(&self) -> bool {
+        self.is_placeholder() || self.name.contains("DeathAdder") || self.name.contains("Basilisk") || self.name.contains("Pro Click")
     }
 
     /// No particular mouse: what the config file is checked against, and what
@@ -295,12 +335,14 @@ static ANY_MOUSE: DeviceSpec = DeviceSpec {
     polling_rates: &RATES_HYPERPOLLING,
     dpi_max: DPI_MAX_ANY,
     sensor_tracking: true,
+    asym_readback: true,
     supports_acceleration: true,
     supports_rotation: true,
     battery: true,
     lighting: &[],
     config: None,
     pairing: true,
+    dongle: DongleKind::Gen2Dome,
     verified: true,
     buttons: BUTTONS,
 };
@@ -337,28 +379,102 @@ pub struct DpiStages {
     pub stages: Vec<(u16, u16)>,
 }
 
-/// What the sensor currently reports: calibration in use, lift mode and height code.
+/// What the sensor currently reports: calibration in use, lift mode, height code and optional asymmetric levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SensorStatus {
     pub use_calibration: bool,
     pub mode: u8,
     pub height: u8,
+    /// (lift-off 2..=26, landing 1..=25) when `0b/85` reports them (Focus Pro 45K Gen-2 on DeathAdder V4 Pro).
+    pub asym_levels: Option<(u8, u8)>,
 }
 
 impl SensorStatus {
     pub fn describe(&self) -> String {
         let m = match (self.mode, self.height) {
-            (0, _) => "not set".to_string(),
-            (1, h) => format!("smart tracking, {} mm", h + 1),
-            (2, h) => format!("universal hysteresis mode, height {h} (not used by Synapse on this mouse)"),
-            (3, _) => "preset lift cut-off mode".into(),
-            (4, _) => "asymmetric cut-off (lift-off / landing levels are not readable)".into(),
-            (5, _) => "manual calibration mode".into(),
-            (6, _) => "manual calibration mode, asymmetric".into(),
-            (m, h) => format!("mode {m} height {h}"),
+            (0, _) => "未设置".to_string(),
+            (1, h) => format!("智能追踪 (Smart Tracking), {} mm", h + 1),
+            (2, h) => format!("通用迟滞模式, 高度 {h}"),
+            (3, _) => "预设抬起截断模式".into(),
+            (4, _) => match self.asym_levels {
+                Some((lift, land)) => format!("非对称抬起截断 (抬起 {lift} / 着陆 {land})"),
+                None => "非对称抬起截断".into(),
+            },
+            (5, _) => "手动校准模式".into(),
+            (6, _) => "手动非对称校准模式".into(),
+            (m, h) => format!("模式 {m} 高度 {h}"),
         };
-        format!("{m}{}", if self.use_calibration && self.mode != 4 { " (calibration data active)" } else { "" })
+        format!("{m}{}", if self.use_calibration && self.mode != 4 { " (校准数据启用)" } else { "" })
     }
+}
+
+/// Validate `r.data_size` (`min_len ..= 80`) and return the declared payload slice.
+pub fn parse_payload<'a>(r: &'a Report, min_len: u8, what: &'static str) -> Result<&'a [u8]> {
+    let n = r.data_size as usize;
+    if n > r.arguments.len() || r.data_size < min_len {
+        return Err(HidError::Invalid(format!("{what}: unexpected payload size {} (expected >= {min_len})", r.data_size)));
+    }
+    Ok(&r.arguments[..n])
+}
+
+/// Decode a Gen-2 dome dongle `07/95` response into `[left, center, right]`, rejecting unknown slot codes.
+pub fn parse_dongle_leds(r: &Report) -> Result<[u8; 3]> {
+    let a = parse_payload(r, 3, "dongle LEDs")?;
+    for &b in &a[..3] {
+        if dongle_led_slot_name_checked(b).is_none() {
+            return Err(HidError::Invalid(format!("unknown dongle LED slot code 0x{b:02x}")));
+        }
+    }
+    Ok([a[0], a[1], a[2]])
+}
+
+/// Decode a Gen-2 dome dongle `07/96` response into `0..=4`, rejecting out-of-range values.
+pub fn parse_dongle_brightness(r: &Report) -> Result<u8> {
+    let a = parse_payload(r, 1, "dongle LED brightness")?;
+    if a[0] > 4 {
+        return Err(HidError::Invalid(format!("unexpected dongle LED brightness {}", a[0])));
+    }
+    Ok(a[0])
+}
+
+/// Decode a Focus Pro 45K Gen-2 `0b/85` response (`[00, 04, 02, lift-1, land-1, ...]`) into 1-based `(lift, land)`.
+pub fn parse_asym_config(r: &Report) -> Result<(u8, u8)> {
+    let a = parse_payload(r, 5, "sensor config")?;
+    if a[..2] != sensor::SENSOR_HDR || a[2] < 2 {
+        return Err(HidError::Invalid(format!("unexpected sensor config header {:02x?}", &a[..3])));
+    }
+    let lo = a[3].saturating_add(1);
+    let ld = a[4].saturating_add(1);
+    if !(sensor::ASYM_LIFT_MIN..=sensor::ASYM_LIFT_MAX).contains(&lo) || !(sensor::ASYM_LAND_MIN..=sensor::ASYM_LAND_MAX).contains(&ld) || ld >= lo {
+        return Err(HidError::Invalid(format!("sensor asymmetric levels {lo}/{ld} out of valid range")));
+    }
+    Ok((lo, ld))
+}
+
+/// Pre-write check: true only when every field in `plan` is proven already equal on the mouse.
+/// On mice without `asym_readback` (Viper V3 Pro), asymmetric levels cannot be read back, so an
+/// asymmetric plan must return `false` to ensure changes like `13/12 -> 20/4` are never skipped.
+pub fn sensor_already_matches(s: &SensorStatus, plan: &SensorPlan, asym_readback: bool) -> bool {
+    if s.mode != plan.lift.0 || s.height != plan.lift.1 || s.use_calibration != plan.state {
+        return false;
+    }
+    if let Some([lo, ld]) = plan.config {
+        return asym_readback && s.asym_levels == Some((lo + 1, ld + 1));
+    }
+    true
+}
+
+/// Post-write check: verifies all readable fields of `plan` after `apply_tracking`.
+pub fn sensor_post_write_ok(s: &SensorStatus, plan: &SensorPlan, asym_readback: bool) -> bool {
+    if s.mode != plan.lift.0 || s.height != plan.lift.1 || s.use_calibration != plan.state {
+        return false;
+    }
+    if asym_readback {
+        if let Some([lo, ld]) = plan.config {
+            return s.asym_levels == Some((lo + 1, ld + 1));
+        }
+    }
+    true
 }
 
 /// Macro memory of the mouse, in bytes.
@@ -802,14 +918,28 @@ impl Mouse {
 
     pub fn dongle_firmware(&self) -> Result<(u8, u8)> {
         self.need_dongle()?;
-        let r = self.raw(&cmd::firmware_version(TID_DONGLE))?;
-        Ok((r.arguments[0], r.arguments[1]))
+        let r = match self.spec.dongle {
+            DongleKind::Gen2Dome => self.raw(&cmd::dongle_gen2_firmware())?,
+            _ => match self.raw(&cmd::firmware_version(TID_DONGLE)) {
+                Ok(r) => r,
+                Err(_) => self.raw(&cmd::dongle_gen2_firmware())?,
+            },
+        };
+        let a = parse_payload(&r, 2, "dongle firmware")?;
+        Ok((a[0], a[1]))
     }
 
     pub fn dongle_serial(&self) -> Result<String> {
         self.need_dongle()?;
-        let r = self.raw(&cmd::serial(TID_DONGLE))?;
-        Ok(ascii(&r.arguments[..22]))
+        let r = match self.spec.dongle {
+            DongleKind::Gen2Dome => self.raw(&cmd::dongle_gen2_serial())?,
+            _ => match self.raw(&cmd::serial(TID_DONGLE)) {
+                Ok(r) => r,
+                Err(_) => self.raw(&cmd::dongle_gen2_serial())?,
+            },
+        };
+        let a = parse_payload(&r, 22, "dongle serial")?;
+        Ok(ascii(&a[..22]))
     }
 
     pub fn device_mode(&self) -> Result<u8> {
@@ -925,24 +1055,114 @@ impl Mouse {
 
     pub fn dongle_led_mode(&self) -> Result<u8> {
         self.need_dongle()?;
+        if self.spec.dongle != DongleKind::HyperPolling {
+            return Err(HidError::Unsupported("single HyperPolling LED mode is not used on this dongle"));
+        }
         Ok(self.raw(&cmd::get_dongle_led_mode())?.arguments[0])
     }
 
     pub fn set_dongle_led_mode(&self, mode: u8) -> Result<()> {
         self.need_dongle()?;
+        if self.spec.dongle != DongleKind::HyperPolling {
+            return Err(HidError::Unsupported("single HyperPolling LED mode is not used on this dongle"));
+        }
         self.raw(&cmd::set_dongle_led_mode(mode)).map(drop)
+    }
+
+    /// 3-LED indicator slots (left, center, right) of the HyperSpeed Gen-2 dome dongle.
+    pub fn dongle_leds(&self) -> Result<[u8; 3]> {
+        self.need_dongle()?;
+        if self.spec.dongle != DongleKind::Gen2Dome {
+            return Err(HidError::Unsupported("3-LED dongle indicator is only available on the Gen-2 dome dongle"));
+        }
+        parse_dongle_leds(&self.raw(&cmd::get_dongle_leds())?)
+    }
+
+    pub fn set_dongle_leds(&self, leds: [u8; 3]) -> Result<()> {
+        self.need_dongle()?;
+        if self.spec.dongle != DongleKind::Gen2Dome {
+            return Err(HidError::Unsupported("3-LED dongle indicator is only available on the Gen-2 dome dongle"));
+        }
+        for &b in &leds {
+            if dongle_led_slot_name_checked(b).is_none() {
+                return Err(HidError::Invalid(format!("unknown dongle LED slot code 0x{b:02x}")));
+            }
+        }
+        self.raw(&cmd::set_dongle_leds(leds)).map(drop)
+    }
+
+    /// Write Gen-2 dome dongle LED slots only when they differ from what the dongle reports.
+    pub fn sync_dongle_leds(&self, want: [u8; 3]) -> Result<bool> {
+        let cur = self.dongle_leds()?;
+        if cur == want {
+            return Ok(false);
+        }
+        self.set_dongle_leds(want)?;
+        Ok(true)
+    }
+
+    pub fn dongle_led_brightness(&self) -> Result<u8> {
+        self.need_dongle()?;
+        if self.spec.dongle != DongleKind::Gen2Dome {
+            return Err(HidError::Unsupported("dongle LED brightness is only available on the Gen-2 dome dongle"));
+        }
+        parse_dongle_brightness(&self.raw(&cmd::get_dongle_led_brightness())?)
+    }
+
+    pub fn set_dongle_led_brightness(&self, level: u8) -> Result<()> {
+        self.need_dongle()?;
+        if self.spec.dongle != DongleKind::Gen2Dome {
+            return Err(HidError::Unsupported("dongle LED brightness is only available on the Gen-2 dome dongle"));
+        }
+        if level > 4 {
+            return Err(HidError::Invalid(format!("dongle LED brightness must be 0..=4 (got {level})")));
+        }
+        self.raw(&cmd::set_dongle_led_brightness(level)).map(drop)
+    }
+
+    /// Write Gen-2 dome dongle LED brightness only when it differs from what the dongle reports.
+    pub fn sync_dongle_led_brightness(&self, want: u8) -> Result<bool> {
+        let cur = self.dongle_led_brightness()?;
+        if cur == want {
+            return Ok(false);
+        }
+        self.set_dongle_led_brightness(want)?;
+        Ok(true)
     }
 
     // --- sensor ---
 
-    pub fn sensor(&self) -> Result<SensorStatus> {
-        let lift = self.raw(&sensor::get_lift())?.arguments;
-        let state = self.raw(&sensor::get_state())?.arguments;
-        Ok(SensorStatus { use_calibration: state[2] != 0, mode: lift[2], height: lift[3] })
+    fn sensor_lock() -> std::sync::MutexGuard<'static, ()> {
+        static SENSOR_SEQ: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SENSOR_SEQ.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Write a tracking plan in the order Synapse's engine for this mouse does.
-    pub fn apply_tracking(&self, plan: &SensorPlan) -> Result<()> {
+    fn sensor_unlocked(&self) -> Result<SensorStatus> {
+        let lift_r = self.raw(&sensor::get_lift())?;
+        let lift = parse_payload(&lift_r, 4, "sensor lift")?;
+        if lift[..2] != sensor::SENSOR_HDR {
+            return Err(HidError::Invalid(format!("unexpected sensor lift header {:02x?}", &lift[..2])));
+        }
+        let state_r = self.raw(&sensor::get_state())?;
+        let state = parse_payload(&state_r, 3, "sensor state")?;
+        if state[..2] != sensor::SENSOR_HDR {
+            return Err(HidError::Invalid(format!("unexpected sensor state header {:02x?}", &state[..2])));
+        }
+        let use_calibration = state[2] != 0;
+        let asym_levels = if self.spec.asym_readback && use_calibration && lift[2] == sensor::LIFT_MODE_ASYMMETRIC {
+            Some(parse_asym_config(&self.raw(&sensor::get_config())?)?)
+        } else {
+            None
+        };
+        Ok(SensorStatus { use_calibration, mode: lift[2], height: lift[3], asym_levels })
+    }
+
+    pub fn sensor(&self) -> Result<SensorStatus> {
+        let _seq = Self::sensor_lock();
+        self.sensor_unlocked()
+    }
+
+    fn apply_tracking_unlocked(&self, plan: &SensorPlan) -> Result<()> {
         if !self.spec.sensor_tracking {
             return Err(HidError::Unsupported("the sensor tracking page is not known to apply to this mouse"));
         }
@@ -966,11 +1186,31 @@ impl Mouse {
             self.raw(&sensor::set_state(false))?;
             tolerant(&sensor::set_lift(plan.lift.0, plan.lift.1))?;
         }
-        let s = self.sensor()?;
-        if s.mode != plan.lift.0 || s.height != plan.lift.1 || s.use_calibration != plan.state {
+        let s = self.sensor_unlocked()?;
+        if !sensor_post_write_ok(&s, plan, self.spec.asym_readback) {
             return Err(crate::hid::HidError::Status(crate::protocol::Status::Failure));
         }
         Ok(())
+    }
+
+    /// Write a tracking plan in the order Synapse's engine for this mouse does.
+    pub fn apply_tracking(&self, plan: &SensorPlan) -> Result<()> {
+        let _seq = Self::sensor_lock();
+        self.apply_tracking_unlocked(plan)
+    }
+
+    /// Read sensor tracking and write `plan` only when it differs, under one sequence lock.
+    pub fn sync_tracking(&self, plan: &SensorPlan) -> Result<bool> {
+        if !self.spec.sensor_tracking {
+            return Err(HidError::Unsupported("the sensor tracking page is not known to apply to this mouse"));
+        }
+        let _seq = Self::sensor_lock();
+        let cur = self.sensor_unlocked()?;
+        if sensor_already_matches(&cur, plan, self.spec.asym_readback) {
+            return Ok(false);
+        }
+        self.apply_tracking_unlocked(plan)?;
+        Ok(true)
     }
 
     /// Sensor rotation: (enabled, degrees).
@@ -1293,18 +1533,6 @@ mod tests {
         assert_eq!((v3.dpi_max, v3.polling, v3.buttons.len()), (26000, PollingStyle::Classic, 13));
         assert_eq!(crate::config_file_name(v3.config), "config-basilisk-v3.toml");
         assert_eq!(button_name(0x6a), Some("scroll-mode"));
-        // The Basilisk V3 Pro (issue 9): cable, HyperSpeed dongle and Mouse Dock Pro are one mouse.
-        for pid in [0x00AA, 0x00AB, 0x00A4] {
-            let p = DeviceSpec::find(pid).unwrap();
-            // Its owner confirmed writes over the cable and through the dock, not the HyperSpeed dongle.
-            assert_eq!(p.verified, pid != 0x00AB, "{}", p.name);
-            assert!(p.battery && !p.pairing && !p.supports_acceleration && !p.supports_rotation, "{}", p.name);
-            assert_eq!((p.dpi_max, p.buttons, p.wireless), (30000, BASILISK_V3_BUTTONS, pid != 0x00AA), "{}", p.name);
-            assert_eq!(crate::config_file_name(p.config), "config-basilisk-v3-pro.toml");
-        }
-        let dock = DeviceSpec::find(0x00A4).unwrap();
-        assert_eq!((dock.polling, dock.rates_text().as_str()), (PollingStyle::HyperPolling, "125/500/1000/2000/4000/8000"));
-        assert_eq!(DeviceSpec::find(0x00AA).unwrap().polling, PollingStyle::Classic);
         assert_eq!(v3.buttons.iter().find(|b| b.name == "dpi").map(|b| b.default), Some(ButtonFunction::dpi_cycle()));
         assert_eq!(BUTTONS[7], PhysicalButton { name: "dpi", code: 0x60, default: ButtonFunction::dpi_cycle() });
         assert_eq!(button_name(0x60), Some("dpi"));
@@ -1334,10 +1562,15 @@ mod tests {
             assert!(!d.polling_rates.is_empty(), "{}", d.name);
             assert!(DEVICES[..i].iter().all(|o| o.product_id != d.product_id), "duplicate 0x{:04x}", d.product_id);
         }
-        // The author's Viper V3 Pro (wired and wireless) and Basilisk V2, the Pro Click V2 Vertical (issue 4)
-        // the Basilisk V3 (issue 5), the Viper V3 Pro SE, wired and through its receiver (issue 8),
-        // and the Basilisk V3 Pro over its cable and the Mouse Dock Pro (issue 9).
+        // The author's Viper V3 Pro (wired and wireless) and Basilisk V2, the Pro Click V2 Vertical (issue 4),
+        // the Basilisk V3 (issue 5), the Viper V3 Pro SE (issue 8), and the DeathAdder V4 Pro (wired and wireless).
         assert_eq!(DEVICES.iter().filter(|d| d.verified).count(), 9);
+        let dav4_wired = DeviceSpec::find(0x00BE).unwrap();
+        assert!(dav4_wired.verified && !dav4_wired.wireless && dav4_wired.sensor_tracking && dav4_wired.is_ergonomic());
+        assert_eq!((dav4_wired.dpi_max, dav4_wired.dongle), (45000, DongleKind::None));
+        let dav4_wireless = DeviceSpec::find(0x00BF).unwrap();
+        assert!(dav4_wireless.verified && dav4_wireless.wireless && dav4_wireless.sensor_tracking && dav4_wireless.is_ergonomic());
+        assert_eq!((dav4_wireless.dpi_max, dav4_wireless.dongle), (45000, DongleKind::Gen2Dome));
     }
 
     #[test]
@@ -1409,6 +1642,63 @@ mod tests {
         for d in DEVICES.iter().filter(|d| d.verified) {
             assert!(guard_write(d, false, &write).is_ok(), "{}", d.name);
         }
+    }
+
+    #[test]
+    fn v4_pro_fw120_fixtures_and_validation() {
+        // Model isolation: V4 Pro enables asym_readback; Viper V3 Pro keeps it off.
+        assert!(DeviceSpec::lookup(0x00BE).asym_readback && DeviceSpec::lookup(0x00BF).asym_readback);
+        assert!(!DeviceSpec::lookup(0x00C0).asym_readback && !DeviceSpec::lookup(0x00C1).asym_readback);
+
+        // Captured on DeathAdder V4 Pro wireless (1532:00BF, fw 1.20) Gen-2 dome dongle:
+        // factory default left=battery (0x02), center=connection (0x01), right=polling (0x03), brightness=4.
+        let mut leds_ok = Report::new(TID_DONGLE, 0x07, 0x95, 0x03).with_args(&[0x02, 0x01, 0x03]);
+        leds_ok.status = 0x02;
+        assert_eq!(parse_dongle_leds(&leds_ok).unwrap(), [0x02, 0x01, 0x03]);
+        assert_eq!(dongle_led_slot_name_checked(0x02), Some("battery"));
+        assert_eq!(dongle_led_slot_name_checked(0x01), Some("connection"));
+        assert_eq!(dongle_led_slot_name_checked(0x03), Some("polling"));
+        assert_eq!(dongle_led_slot_name_checked(0x09), None);
+
+        // Truncated data_size or unknown LED code must error rather than silently coerce to "off".
+        let leds_short = Report::new(TID_DONGLE, 0x07, 0x95, 0x02).with_args(&[0x02, 0x01, 0x03]);
+        assert!(parse_dongle_leds(&leds_short).is_err());
+        let leds_bad = Report::new(TID_DONGLE, 0x07, 0x95, 0x03).with_args(&[0x02, 0x09, 0x03]);
+        assert!(parse_dongle_leds(&leds_bad).is_err());
+
+        let br_ok = Report::new(TID_DONGLE, 0x07, 0x96, 0x01).with_args(&[0x04]);
+        assert_eq!(parse_dongle_brightness(&br_ok).unwrap(), 4);
+        let br_bad = Report::new(TID_DONGLE, 0x07, 0x96, 0x01).with_args(&[0x05]);
+        assert!(parse_dongle_brightness(&br_bad).is_err());
+
+        // Captured on DeathAdder V4 Pro (1532:00BF, fw 1.20) 0b/85 responses for 13/12, 20/4, 26/25:
+        for ((want_lo, want_ld), raw) in [
+            ((13, 12), [0x00, 0x04, 0x02, 0x0c, 0x0b, 0, 0, 0, 0, 0, 0]),
+            ((20, 4), [0x00, 0x04, 0x02, 0x13, 0x03, 0, 0, 0, 0, 0, 0]),
+            ((26, 25), [0x00, 0x04, 0x02, 0x19, 0x18, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let r = Report::new(TID_MOUSE, 0x0b, 0x85, 0x0b).with_args(&raw);
+            assert_eq!(parse_asym_config(&r).unwrap(), (want_lo, want_ld));
+        }
+
+        // Synthetic short packet (data_size = 4, padding byte 0 at [4]) must NOT decode as 13/1.
+        let short_cfg = Report::new(TID_MOUSE, 0x0b, 0x85, 0x04).with_args(&[0x00, 0x04, 0x02, 0x0c]);
+        assert!(parse_asym_config(&short_cfg).is_err());
+
+        // Pre-write & post-write checks: V4 Pro skips identical 13/12 and rejects readback 20/19;
+        // Viper V3 Pro (asym_readback = false) never skips asymmetric pre-write so 13/12 -> 20/4 writes.
+        let plan_13_12 = sensor::Tracking::Asymmetric { lift: 13, land: 12 }.plan().unwrap();
+        let st_match = SensorStatus { use_calibration: true, mode: 4, height: 0, asym_levels: Some((13, 12)) };
+        let st_wrong = SensorStatus { use_calibration: true, mode: 4, height: 0, asym_levels: Some((20, 19)) };
+        let st_none = SensorStatus { use_calibration: true, mode: 4, height: 0, asym_levels: None };
+        assert!(sensor_already_matches(&st_match, &plan_13_12, true));
+        assert!(!sensor_already_matches(&st_wrong, &plan_13_12, true));
+        assert!(!sensor_already_matches(&st_none, &plan_13_12, true));
+        assert!(!sensor_already_matches(&st_none, &plan_13_12, false), "Viper must not skip unknown asym levels");
+        assert!(sensor_post_write_ok(&st_match, &plan_13_12, true));
+        assert!(!sensor_post_write_ok(&st_wrong, &plan_13_12, true));
+        assert!(!sensor_post_write_ok(&st_none, &plan_13_12, true));
+        assert!(sensor_post_write_ok(&st_none, &plan_13_12, false));
     }
 }
 
