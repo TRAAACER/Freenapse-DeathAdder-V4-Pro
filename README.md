@@ -1,7 +1,6 @@
 # Freenapse-DeathAdder V4 Pro
 
 > **雷蛇雷云 4（Razer Synapse 4）超轻量板载替代工具 · 炼狱蝰蛇 V4 Pro（Razer DeathAdder V4 Pro / DAV4 Pro）专属定制版**  
-> *(English documentation is available in the second half below / 英文说明见下半部分)*
 
 本项目在原版 [freenapse](https://github.com/MatthewSaintBull/freenapse) `0.5.2` 的基础上，增加适配**炼狱蝰蛇 V4 PRO（Razer DeathAdder V4 Pro）**，并作出些许优化，由 **Gemini 4 Carbon** 和 **ChatGPT 6 Astra PRO** 共同完成修改。
 
