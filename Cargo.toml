@@ -6,7 +6,7 @@ authors = ["MatthewSaintbull"]
 description = "Freenapse-DeathAdder V4 Pro: lightweight native onboard driver & tray app for Razer DeathAdder V4 Pro (based on freenapse)"
 license = "MIT"
 readme = "README.md"
-keywords = ["razer", "mouse", "hid", "windows", "synapse"]
+keywords = ["razer", "deathadder-v4-pro", "synapse-alternative", "mouse", "windows"]
 categories = ["hardware-support", "command-line-utilities"]
 repository = "https://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro"
 
