@@ -49,7 +49,7 @@
 
 ---
 
-# Freenapse-DeathAdder V4 Pro (English)
+# Freenapse-DeathAdder V4 Pro
 
 > **Lightweight Razer Synapse 4 Onboard Alternative · Custom Edition for Razer DeathAdder V4 Pro (`DAV4 Pro`)**  
 > *(Note: The GUI and tray menu in this custom build are localized in Simplified Chinese; `config.toml` and CLI commands remain standard ASCII/English.)*
