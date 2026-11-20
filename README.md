@@ -4,7 +4,7 @@
 
 本项目在原版 [freenapse](https://github.com/MatthewSaintBull/freenapse) `0.5.2` 的基础上，增加适配**炼狱蝰蛇 V4 PRO（Razer DeathAdder V4 Pro）**，并作出些许优化，由 **Gemini 4 Carbon** 和 **ChatGPT 6 Astra PRO** 共同完成修改。
 
-后续没啥恶性 Bug 的话，不打算更新，单纯分享使用，省一省大家的token。
+个人使用，分享出来，省一省大家的token。
 
 👉 **[前往 Releases 下载单文件 `freenapse.exe` 即开即用](https://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro/releases/latest)**
 
@@ -55,7 +55,7 @@
 
 Built upon upstream [freenapse](https://github.com/MatthewSaintBull/freenapse) `v0.5.2`, this project adds full hardware support for the **Razer DeathAdder V4 Pro** along with background performance and anti-cheat safety optimizations, co-developed with **Gemini 4 Carbon** and **ChatGPT 6 Astra PRO**.
 
-Unless critical bugs arise, no regular updates are planned — shared simply for everyone to use and save tokens.
+shared simply for everyone to use and save tokens.
 
 👉 **[Download standalone `freenapse.exe` from Releases](https://github.com/TRAAACER/Freenapse-DeathAdder-V4-Pro/releases/latest)**
 
