@@ -111,15 +111,6 @@ pub fn import(mouse: &Mouse) -> Result<Config> {
     }
 
     cfg.profile.active = mouse.profile();
-    // Macros already in the mouse (Synapse's or ours): keep them so their bindings stay valid.
-    if let Ok(ids) = mouse.macro_ids().and_then(|ids| if mouse.macro_support()? { Ok(ids) } else { Ok(Vec::new()) }) {
-        for id in ids {
-            let Ok(data) = mouse.macro_data(id) else { continue };
-            let name = mouse.macro_name(id).ok().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Macro {id}"));
-            let events = crate::macros::event_specs(&crate::macros::decode(&data));
-            cfg.macros.push(crate::config::MacroConfig { id, name, events });
-        }
-    }
     for b in mouse.spec().buttons {
         let name = b.name;
         for hs in [false, true] {
@@ -274,19 +265,14 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
     }
 
     changes.extend(apply_lighting(mouse, cfg)?);
-    changes.extend(apply_macros(mouse, cfg)?);
 
     // Every button of both layers: a key missing from [buttons] means its default function.
-    let onboard = mouse.macro_support()?;
     for b in mouse.spec().buttons {
         let (name, code) = (b.name, b.code);
         for hs in [false, true] {
             let key = if hs { format!("hypershift.{name}") } else { name.to_string() };
             let spec = cfg.buttons.get(&key);
-            let func = match spec.map(|s| parse_button(s)) {
-                Some(Ok(Some(f))) => cfg.resolve_button(f, onboard),
-                _ => b.default,
-            };
+            let func = spec.and_then(|s| parse_button(s).ok().flatten()).unwrap_or(b.default);
             let Some(current) = current_button(mouse, code, name, hs, spec.is_some())? else { continue };
             if current != func {
                 mouse.set_button(mouse.profile(), code, hs, func)?;
@@ -321,46 +307,21 @@ pub fn apply_lighting(mouse: &Mouse, cfg: &Config) -> Result<Vec<String>> {
     Ok(changes)
 }
 
-/// The function to write for a config assignment on this mouse.
-pub fn resolve(mouse: &Mouse, cfg: &Config, f: ButtonFunction) -> Result<ButtonFunction> {
-    Ok(cfg.resolve_button(f, mouse.macro_support()?))
-}
-
-/// Store every configured macro whose bytes differ from what the mouse holds.
-/// Macros in the mouse that the config does not list are left alone. Mice
-/// without macro memory get nothing: the tray app plays their macros.
-pub fn apply_macros(mouse: &Mouse, cfg: &Config) -> Result<Vec<String>> {
-    let mut changes = Vec::new();
-    if cfg.macros.is_empty() || !mouse.macro_support()? {
-        return Ok(changes);
-    }
-    let stored = mouse.macro_ids()?;
-    for m in &cfg.macros {
-        if cfg.macro_needs_software(m.id) {
-            continue; // text / launch steps: played by the tray app, nothing to store
-        }
-        let bytes = m.bytes();
-        let same = stored.contains(&m.id) && mouse.macro_data(m.id)? == bytes;
-        if !same {
-            mouse.write_macro(m.id, &m.name, &bytes)?;
-            changes.push(format!("macro {} ({}) -> {} bytes", m.id, m.name, bytes.len()));
-        }
-    }
-    Ok(changes)
+/// Desired normal-layer [`ButtonFunction`] for `b` (with optional `game` overrides)
+/// and whether the config explicitly names `b.name`.
+pub fn normal_button_target(cfg: &Config, game: Option<&crate::config::GameOverrides>, b: &crate::device::PhysicalButton) -> (ButtonFunction, bool) {
+    let spec = game.and_then(|g| g.buttons.get(b.name)).or_else(|| cfg.buttons.get(b.name));
+    let func = spec.and_then(|s| parse_button(s).ok().flatten()).unwrap_or(b.default);
+    (func, spec.is_some())
 }
 
 /// Write the button layout of a game (or the base layout when `game` is None)
 /// for the normal layer. Returns true when anything was written.
 pub fn apply_game_buttons(mouse: &Mouse, cfg: &Config, game: Option<&crate::config::GameOverrides>) -> Result<bool> {
     let mut written = false;
-    let onboard = mouse.macro_support()?;
     for b in mouse.spec().buttons {
-        let spec = game.and_then(|g| g.buttons.get(b.name)).or_else(|| cfg.buttons.get(b.name));
-        let func = match spec.map(|s| parse_button(s)) {
-            Some(Ok(Some(f))) => cfg.resolve_button(f, onboard),
-            _ => b.default,
-        };
-        let Some(current) = current_button(mouse, b.code, b.name, false, spec.is_some())? else { continue };
+        let (func, bound) = normal_button_target(cfg, game, b);
+        let Some(current) = current_button(mouse, b.code, b.name, false, bound)? else { continue };
         if current != func {
             mouse.set_button(mouse.profile(), b.code, false, func)?;
             written = true;

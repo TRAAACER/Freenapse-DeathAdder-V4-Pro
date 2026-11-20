@@ -43,10 +43,6 @@ USAGE:
   freenapse buttons [profile]            show the onboard button mapping (default profile 1)
   freenapse profiles                     onboard profiles: how many exist, how many the mouse can hold
   freenapse profile <1..5>               select the onboard profile (created if the mouse has room)
-  freenapse macros                       macros stored in the mouse and the macro memory left
-  freenapse macro-read <id>              print a stored macro's steps in config form
-  freenapse macro-write <id>             store the macro with this id from the config file
-  freenapse macro-delete <id>            remove a macro from the mouse
   freenapse pair-status                  devices the dongle is paired with, auto-pairing state
   freenapse pair [pid]                   put the dongle in pairing mode (default: this mouse's wireless id)
   freenapse pair-cancel [pid]            leave pairing mode
@@ -59,8 +55,7 @@ USAGE:
   freenapse watch [n]                    read the battery once a second
   freenapse version                      print the version
 
-Run freenapse.exe without arguments for the tray icon (battery, DPI stage and polling switch,
-per-game profiles, macro playback).
+Run freenapse.exe without arguments for the tray icon (battery status and per-game onboard profiles).
 
 Any command, and the tray, accept --log or --log=<file> to record every exchange with the mouse
 (default: hid.log next to the config file). A crash writes crash.txt there. Attach both to an issue.
@@ -277,41 +272,6 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 format!("{e} (the mouse holds {n} of at most {max} profiles)")
             })?;
             println!("onboard profile {id} selected; set profile.active = {id} in the config to keep using it");
-        }
-        "macros" => {
-            let st = mouse.macro_storage()?;
-            println!("macro memory: {} of {} bytes free ({} recyclable), ids up to {}", st.available, st.total, st.recyclable, st.max_id);
-            let ids = mouse.macro_ids()?;
-            if ids.is_empty() {
-                println!("no macros stored");
-            }
-            for id in ids {
-                let name = mouse.macro_name(id).unwrap_or_default();
-                let size = mouse.macro_data_size(id).map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-                println!("{id:>5}  {size:>6} bytes  {name}");
-            }
-        }
-        "macro-read" => {
-            let id: u16 = arg(args, 0, "macro id")?;
-            let data = mouse.macro_data(id)?;
-            let events = freenapse::macros::decode(&data);
-            println!("name = {:?}", mouse.macro_name(id).unwrap_or_default());
-            println!("events = {:?}", freenapse::macros::event_specs(&events));
-            println!("bytes = {data:02x?}");
-        }
-        "macro-write" => {
-            let id: u16 = arg(args, 0, "macro id")?;
-            let cfg = Config::load_or_create(&config_path())?;
-            let m = cfg.macro_by_id(id).ok_or_else(|| format!("macro {id} is not in the config file"))?;
-            let bytes = m.bytes();
-            mouse.write_macro(id, &m.name, &bytes)?;
-            let back = mouse.macro_data(id)?;
-            println!("macro {id} ({}) stored: {} bytes, read back {}", m.name, bytes.len(), if back == bytes { "identical" } else { "DIFFERENT" });
-        }
-        "macro-delete" => {
-            let id: u16 = arg(args, 0, "macro id")?;
-            mouse.delete_macro(id)?;
-            println!("macro {id} deleted; remaining ids {:?}", mouse.macro_ids()?);
         }
         "pair-status" => {
             for d in mouse.paired_devices()? {

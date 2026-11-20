@@ -21,8 +21,6 @@ pub mod diag;
 pub mod hid;
 pub mod library;
 pub mod lighting;
-pub mod macros;
-pub mod player;
 pub mod probe;
 pub mod protocol;
 pub mod sensor;

@@ -10,7 +10,6 @@ use std::time::Duration;
 use crate::accel;
 use crate::hid::{HidDevice, HidError, Result};
 use crate::lighting;
-use crate::macros::{self, Playback};
 use crate::protocol::{HID_BUF_LEN, Report, TID_DONGLE, TID_MOUSE, cmd};
 use crate::sensor::{self, SensorPlan};
 
@@ -477,15 +476,6 @@ pub fn sensor_post_write_ok(s: &SensorStatus, plan: &SensorPlan, asym_readback: 
     true
 }
 
-/// Macro memory of the mouse, in bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MacroStorage {
-    pub max_id: u16,
-    pub total: u32,
-    pub available: u32,
-    pub recyclable: u32,
-}
-
 /// A device the dongle is paired with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairedDevice {
@@ -563,29 +553,6 @@ impl ButtonFunction {
     pub fn power_key(code: u8) -> Self {
         ButtonFunction([0x09, 1, code, 0, 0, 0, 0])
     }
-    /// Onboard macro with one of Synapse's playback options.
-    pub fn macro_play(id: u16, play: Playback) -> Self {
-        let b = id.to_be_bytes();
-        match play {
-            Playback::Times(n) => ButtonFunction([0x03, 3, b[0], b[1], n.max(1), 0, 0]),
-            Playback::Held => ButtonFunction([0x04, 2, b[0], b[1], 0, 0, 0]),
-            Playback::Toggle => ButtonFunction([0x05, 2, b[0], b[1], 0, 0, 0]),
-            Playback::Sequence => ButtonFunction([0x0f, 2, b[0], b[1], 0, 0, 0]),
-        }
-    }
-
-    /// (macro id, playback) when this is a macro function.
-    pub fn macro_binding(&self) -> Option<(u16, Playback)> {
-        let d = &self.0;
-        let id = u16::from_be_bytes([d[2], d[3]]);
-        Some(match d[0] {
-            0x03 => (id, Playback::Times(d[4].max(1))),
-            0x04 => (id, Playback::Held),
-            0x05 => (id, Playback::Toggle),
-            0x0f => (id, Playback::Sequence),
-            _ => return None,
-        })
-    }
 
     /// Repeat rate of a turbo function, in presses per second.
     pub fn turbo_rate(&self) -> Option<u8> {
@@ -614,10 +581,6 @@ impl ButtonFunction {
                 x => format!("system key 0x{x:02x}"),
             },
             0x0a => format!("media key 0x{:04x}", u16::from_be_bytes([d[2], d[3]])),
-            0x03..=0x05 | 0x0f => {
-                let (id, play) = self.macro_binding().unwrap_or((0, Playback::Times(1)));
-                format!("macro {id} ({})", play.label().to_lowercase())
-            }
             0x06 => match d[2] {
                 0x01 => "DPI cycle up".into(),
                 0x02 => "DPI cycle down".into(),
@@ -639,6 +602,140 @@ impl ButtonFunction {
             x => format!("unknown 0x{x:02x} {:02x?}", &d[1..]),
         }
     }
+
+    /// Append every Windows virtual key (`VK_*`) this onboard assignment can hold down
+    /// (mouse buttons, keyboard modifiers and the main key usage), deduplicated.
+    pub fn push_virtual_keys(&self, out: &mut Vec<u16>) {
+        let mut add = |vk: u16| {
+            if !out.contains(&vk) {
+                out.push(vk);
+            }
+        };
+        let d = &self.0;
+        match d[0] {
+            0x01 | 0x0e => match d[2] {
+                0x01 => add(0x01), // VK_LBUTTON
+                0x02 => add(0x02), // VK_RBUTTON
+                0x03 => add(0x04), // VK_MBUTTON
+                0x04 => add(0x05), // VK_XBUTTON1
+                0x05 => add(0x06), // VK_XBUTTON2
+                _ => {}
+            },
+            0x0b => add(0x01), // double-click emits left button
+            0x02 | 0x0d => {
+                let mods = d[2];
+                if mods & 0x01 != 0 {
+                    add(0x11); // VK_CONTROL
+                    add(0xa2); // VK_LCONTROL
+                }
+                if mods & 0x02 != 0 {
+                    add(0x10); // VK_SHIFT
+                    add(0xa0); // VK_LSHIFT
+                }
+                if mods & 0x04 != 0 {
+                    add(0x12); // VK_MENU
+                    add(0xa4); // VK_LMENU
+                }
+                if mods & 0x08 != 0 {
+                    add(0x5b); // VK_LWIN
+                }
+                if mods & 0x10 != 0 {
+                    add(0x11); // VK_CONTROL
+                    add(0xa3); // VK_RCONTROL
+                }
+                if mods & 0x20 != 0 {
+                    add(0x10); // VK_SHIFT
+                    add(0xa1); // VK_RSHIFT
+                }
+                if mods & 0x40 != 0 {
+                    add(0x12); // VK_MENU
+                    add(0xa5); // VK_RMENU
+                }
+                if mods & 0x80 != 0 {
+                    add(0x5c); // VK_RWIN
+                }
+                if let Some(vk) = usage_vk(d[3]) {
+                    add(vk);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Keyboard HID usage of a Windows virtual key (US layout for the punctuation keys).
+pub fn vk_usage(vk: u16) -> Option<u8> {
+    Some(match vk {
+        0x41..=0x5a => 0x04 + (vk - 0x41) as u8, // A..Z
+        0x31..=0x39 => 0x1e + (vk - 0x31) as u8, // 1..9
+        0x30 => 0x27,                            // 0
+        0x0d => 0x28,                            // Enter
+        0x1b => 0x29,                            // Esc
+        0x08 => 0x2a,                            // Backspace
+        0x09 => 0x2b,                            // Tab
+        0x20 => 0x2c,                            // Space
+        0xbd => 0x2d,                            // -
+        0xbb => 0x2e,                            // =
+        0xdb => 0x2f,                            // [
+        0xdd => 0x30,                            // ]
+        0xdc => 0x31,                            // backslash
+        0xba => 0x33,                            // ;
+        0xde => 0x34,                            // '
+        0xc0 => 0x35,                            // `
+        0xbc => 0x36,                            // ,
+        0xbe => 0x37,                            // .
+        0xbf => 0x38,                            // /
+        0x14 => 0x39,                            // Caps lock
+        0x70..=0x7b => 0x3a + (vk - 0x70) as u8, // F1..F12
+        0x7c..=0x87 => 0x68 + (vk - 0x7c) as u8, // F13..F24
+        0x2c => 0x46,                            // Print screen
+        0x91 => 0x47,                            // Scroll lock
+        0x13 => 0x48,                            // Pause
+        0x2d => 0x49,                            // Insert
+        0x24 => 0x4a,                            // Home
+        0x21 => 0x4b,                            // Page up
+        0x2e => 0x4c,                            // Delete
+        0x23 => 0x4d,                            // End
+        0x22 => 0x4e,                            // Page down
+        0x27 => 0x4f,                            // Right
+        0x25 => 0x50,                            // Left
+        0x28 => 0x51,                            // Down
+        0x26 => 0x52,                            // Up
+        0x90 => 0x53,                            // Num lock
+        0x6f => 0x54,                            // keypad /
+        0x6a => 0x55,                            // keypad *
+        0x6d => 0x56,                            // keypad -
+        0x6b => 0x57,                            // keypad +
+        0x61..=0x69 => 0x59 + (vk - 0x61) as u8, // keypad 1..9
+        0x60 => 0x62,                            // keypad 0
+        0x6e => 0x63,                            // keypad .
+        0xa2 => 0xe0,                            // left ctrl
+        0xa0 => 0xe1,                            // left shift
+        0xa4 => 0xe2,                            // left alt
+        0x5b => 0xe3,                            // left win
+        0xa3 => 0xe4,                            // right ctrl
+        0xa1 => 0xe5,                            // right shift
+        0xa5 => 0xe6,                            // right alt
+        0x5c => 0xe7,                            // right win
+        _ => return None,
+    })
+}
+
+/// Inverse of [`vk_usage`].
+pub fn usage_vk(usage: u8) -> Option<u16> {
+    (0x08..=0xfeu16).find(|vk| vk_usage(*vk) == Some(usage))
+}
+
+/// Decode a `02/8c` button-function response, verifying payload size and the `(profile, button)` header.
+/// (`arguments[2]` is not checked because DeathAdder V4 Pro firmware uses it as a button flag rather than echoing `hypershift`.)
+pub fn parse_button_function(r: &Report, profile: u8, button: u8) -> Result<ButtonFunction> {
+    let a = parse_payload(r, 10, "button function")?;
+    if a[..2] != [profile, button] {
+        return Err(HidError::NoResponse);
+    }
+    let mut f = [0u8; 7];
+    f.copy_from_slice(&a[3..10]);
+    Ok(ButtonFunction(f))
 }
 
 /// System key codes of the power-key function (Synapse: SystemPower, SystemSleep, SystemWake).
@@ -769,8 +866,6 @@ pub struct Mouse {
     allow_unverified: bool,
     /// Onboard profile that button and acceleration commands address.
     profile: std::cell::Cell<u8>,
-    /// Whether the mouse has macro memory (None until asked).
-    macro_support: std::cell::Cell<Option<bool>>,
 }
 
 impl Mouse {
@@ -822,7 +917,7 @@ impl Mouse {
 
     fn from_hid(hid: HidDevice, allow_unverified: bool) -> Mouse {
         let spec = DeviceSpec::lookup(hid.info.product_id);
-        Mouse { hid, spec, allow_unverified, profile: std::cell::Cell::new(1), macro_support: std::cell::Cell::new(None) }
+        Mouse { hid, spec, allow_unverified, profile: std::cell::Cell::new(1) }
     }
 
     /// What the table says about this mouse.
@@ -841,23 +936,6 @@ impl Mouse {
 
     pub fn vendor_id(&self) -> u16 {
         self.hid.info.vendor_id
-    }
-
-    /// True when the mouse stores macros itself. A mouse without macro memory
-    /// (the Viper V3 Pro, the Pro Click V2 Vertical) answers "not supported"
-    /// to every macro command, so its macros are played by the tray app
-    /// instead. Errors other than NotSupported (asleep) are propagated.
-    pub fn macro_support(&self) -> Result<bool> {
-        if let Some(v) = self.macro_support.get() {
-            return Ok(v);
-        }
-        let v = match self.raw(&macros::get_storage_info()) {
-            Ok(_) => true,
-            Err(HidError::Status(crate::protocol::Status::NotSupported)) => false,
-            Err(e) => return Err(e),
-        };
-        self.macro_support.set(Some(v));
-        Ok(v)
     }
 
     /// The onboard profile this handle writes to and reads from (1 until [`Mouse::select_profile`]).
@@ -1372,88 +1450,12 @@ impl Mouse {
     // --- buttons ---
 
     pub fn button(&self, profile: u8, button: u8, hypershift: bool) -> Result<ButtonFunction> {
-        let a = self.raw(&cmd::get_button_function(profile, button, hypershift))?.arguments;
-        let mut f = [0u8; 7];
-        f.copy_from_slice(&a[3..10]);
-        Ok(ButtonFunction(f))
+        let r = self.raw(&cmd::get_button_function(profile, button, hypershift))?;
+        parse_button_function(&r, profile, button)
     }
 
     pub fn set_button(&self, profile: u8, button: u8, hypershift: bool, f: ButtonFunction) -> Result<()> {
         self.raw(&cmd::set_button_function(profile, button, hypershift, &f.0)).map(drop)
-    }
-
-    // --- onboard macros ---
-
-    pub fn macro_storage(&self) -> Result<MacroStorage> {
-        let a = self.raw(&macros::get_storage_info())?.arguments;
-        let dw = |o: usize| u32::from_be_bytes([a[o], a[o + 1], a[o + 2], a[o + 3]]);
-        Ok(MacroStorage { max_id: u16::from_be_bytes([a[0], a[1]]), total: dw(2), available: dw(6), recyclable: dw(10) })
-    }
-
-    /// Ids of the macros stored in the mouse.
-    pub fn macro_ids(&self) -> Result<Vec<u16>> {
-        let a = self.raw(&macros::get_id_list())?.arguments;
-        let n = (u16::from_be_bytes([a[2], a[3]]) as usize).min(38);
-        Ok((0..n).map(|i| u16::from_be_bytes([a[4 + 2 * i], a[5 + 2 * i]])).collect())
-    }
-
-    pub fn macro_data_size(&self, id: u16) -> Result<u32> {
-        let a = self.raw(&macros::get_data_size(id))?.arguments;
-        Ok(u32::from_be_bytes([a[2], a[3], a[4], a[5]]))
-    }
-
-    /// The stored event bytes of a macro.
-    pub fn macro_data(&self, id: u16) -> Result<Vec<u8>> {
-        let size = self.macro_data_size(id)? as usize;
-        let mut out = Vec::with_capacity(size);
-        while out.len() < size {
-            let want = (size - out.len()).min(macros::DATA_CHUNK) as u8;
-            let a = self.raw(&macros::get_data_chunk(id, out.len() as u32, want))?.arguments;
-            let got = (a[6] as usize).min(macros::DATA_CHUNK);
-            if got == 0 {
-                break;
-            }
-            out.extend_from_slice(&a[7..7 + got]);
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(out)
-    }
-
-    /// The name stored in the macro's name structure.
-    pub fn macro_name(&self, id: u16) -> Result<String> {
-        let a = self.raw(&macros::get_name_chunk(id, 0))?.arguments;
-        Ok(macros::name_from_structure(&a[6..]))
-    }
-
-    /// Store a macro, replacing any with the same id, in Synapse's order:
-    /// allocate, name structure in 64-byte chunks, event data in 72-byte chunks.
-    pub fn write_macro(&self, id: u16, name: &str, data: &[u8]) -> Result<()> {
-        if self.macro_ids()?.contains(&id) {
-            self.raw(&macros::delete(id))?;
-            thread::sleep(Duration::from_millis(20));
-        }
-        let st = self.macro_storage()?;
-        if macros::required_memory(data.len()) > st.available {
-            return Err(HidError::Unsupported("not enough macro memory in the mouse: delete a macro first"));
-        }
-        self.raw(&macros::allocate(id, data.len() as u32))?;
-        thread::sleep(Duration::from_millis(10));
-        let s = macros::name_structure(id, name, data.len() as u32);
-        for off in (0..macros::NAME_STRUCT_LEN).step_by(macros::NAME_CHUNK) {
-            let end = (off + macros::NAME_CHUNK).min(macros::NAME_STRUCT_LEN);
-            self.raw(&macros::set_name_chunk(id, off as u16, macros::NAME_STRUCT_LEN as u16, &s[off..end]))?;
-            thread::sleep(Duration::from_millis(10));
-        }
-        for off in (0..data.len()).step_by(macros::DATA_CHUNK) {
-            let end = (off + macros::DATA_CHUNK).min(data.len());
-            self.raw(&macros::set_data_chunk(id, off as u32, &data[off..end]))?;
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(())
-    }
-
-    pub fn delete_macro(&self, id: u16) -> Result<()> {
-        self.raw(&macros::delete(id)).map(drop)
     }
 
     // --- dongle pairing ---
@@ -1699,6 +1701,30 @@ mod tests {
         assert!(!sensor_post_write_ok(&st_wrong, &plan_13_12, true));
         assert!(!sensor_post_write_ok(&st_none, &plan_13_12, true));
         assert!(sensor_post_write_ok(&st_none, &plan_13_12, false));
+
+        // Button readback validation & virtual key extraction for gesture protection:
+        let mut btn_ok = cmd::get_button_function(1, 0x05, false);
+        btn_ok.status = 0x02;
+        btn_ok.arguments[2..10].copy_from_slice(&[0x01, 0x02, 0x02, 0x08, 0x07, 0, 0, 0]);
+        let parsed = parse_button_function(&btn_ok, 1, 0x05).unwrap();
+        assert_eq!(parsed, ButtonFunction::key(0x08, 0x07));
+        assert!(parse_button_function(&btn_ok, 1, 0x04).is_err(), "wrong button code must fail");
+        let short_btn = Report::new(TID_MOUSE, 0x02, 0x8c, 0x05).with_args(&[1, 5, 0, 2, 2]);
+        assert!(parse_button_function(&short_btn, 1, 0x05).is_err(), "truncated payload must fail");
+
+        let mut vks = Vec::new();
+        parsed.push_virtual_keys(&mut vks);
+        assert_eq!(vks, vec![0x5b, 0x44], "Win+D extracts VK_LWIN and 'D'");
+        ButtonFunction::consumer(0x00e2).push_virtual_keys(&mut vks);
+        assert_eq!(vks, vec![0x5b, 0x44], "media:mute adds no keyboard/mouse VKs");
+        ButtonFunction::mouse_button(0x05).push_virtual_keys(&mut vks);
+        assert_eq!(vks, vec![0x5b, 0x44, 0x06], "mouse:forward adds VK_XBUTTON2");
+
+        for vk in [0x41u16, 0x30, 0x0d, 0x20, 0x7c, 0x87, 0x25, 0xa2, 0xa0] {
+            let u = vk_usage(vk).unwrap();
+            assert_eq!(usage_vk(u), Some(vk), "vk {vk:#x}");
+        }
+        assert_eq!(vk_usage(0x10), None);
     }
 }
 

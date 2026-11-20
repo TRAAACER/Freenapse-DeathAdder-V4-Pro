@@ -6,7 +6,6 @@
 
 use crate::device::{ButtonFunction, DeviceSpec, Mouse, VENDOR_RAZER};
 use crate::hid::{HidDevice, HidError, Result};
-use crate::macros;
 use crate::protocol::{Report, Status, TID_DONGLE, TID_MOUSE, cmd};
 use crate::sensor;
 
@@ -303,11 +302,6 @@ pub fn run_with(mouse: &Mouse, show_serials: bool, emit: &mut dyn FnMut(String))
         Some(format!("ids {:?}", &r.arguments[1..1 + n]))
     });
     p.read("active profile", cmd::get_active_profile(), &|r| Some(format!("profile {}", r.arguments[0])));
-    p.read("macro storage", macros::get_storage_info(), &|r| {
-        let a = &r.arguments;
-        let dw = |o: usize| u32::from_be_bytes([a[o], a[o + 1], a[o + 2], a[o + 3]]);
-        Some(format!("ids up to {}, {} of {} bytes free", u16::from_be_bytes([a[0], a[1]]), dw(6), dw(2)))
-    });
     p.blank();
 
     p.read("sensor state", sensor::get_state(), &|r| Some(format!("calibration data in use: {}", r.arguments[2] != 0)));
@@ -373,8 +367,8 @@ mod tests {
         resp.arguments[..5].copy_from_slice(&[0x01, 0x03, 0x20, 0x03, 0x20]);
         let l = line("dpi", &req, &Ok(resp));
         assert_eq!(l, format!("{:<22} tid 1f 04/85/07  status=02 args=01 03 20 03 20 00 00 00 00 00 00 00 00 00 00 00", "dpi"));
-        let l = line("macro storage", &macros::get_storage_info(), &Err(HidError::Status(Status::NotSupported)));
-        assert!(l.ends_with("06/8e/0e  no answer (status 05 not supported)"), "{l}");
+        let l = line("active profile", &cmd::get_active_profile(), &Err(HidError::Status(Status::NotSupported)));
+        assert!(l.ends_with("05/84/01  no answer (status 05 not supported)"), "{l}");
         let l = line("x", &cmd::firmware_version(0xff), &Err(HidError::Status(Status::Timeout)));
         assert!(l.contains("tid ff 00/81/02  no answer (status 04 timeout"), "{l}");
         assert_eq!(explain(&HidError::BadStatus(0x77)), "status 77 unknown");

@@ -111,9 +111,18 @@ impl Report {
         }
     }
 
-    /// True when the response was produced for this request (same class/id).
+    /// True when the response was produced for this request (same class/id, and
+    /// same `(profile, button)` slot on a `02/8c` button read; `arguments[2]` is
+    /// not checked because DeathAdder V4 Pro firmware uses it as a button flag
+    /// rather than echoing `hypershift`).
     pub fn matches(&self, request: &Report) -> bool {
-        self.command_class == request.command_class && self.command_id == request.command_id
+        if self.command_class != request.command_class || self.command_id != request.command_id {
+            return false;
+        }
+        if (self.command_class, self.command_id) == (0x02, 0x8c) {
+            return self.arguments[..2] == request.arguments[..2];
+        }
+        true
     }
 }
 
@@ -443,5 +452,24 @@ mod tests {
         assert_eq!((get_leds.transaction_id, get_leds.command_class, get_leds.command_id, get_leds.data_size), (TID_DONGLE, 0x07, 0x95, 0x03));
         let br = cmd::set_dongle_led_brightness(9);
         assert_eq!((br.command_class, br.command_id, br.arguments[0]), (0x07, 0x16, 4));
+    }
+
+    #[test]
+    fn button_read_matches_profile_and_button() {
+        // Real DeathAdder V4 Pro (1532:00BF, fw 1.20) 02/8c responses:
+        // normal left (0x01, hs=0) answers args=[01, 01, 01, ...]; hypershift back (0x04, hs=1) answers args=[01, 04, 00, ...].
+        let req_left = cmd::get_button_function(1, 0x01, false);
+        let mut resp_left = req_left.clone();
+        resp_left.status = 0x02;
+        resp_left.arguments[..6].copy_from_slice(&[0x01, 0x01, 0x01, 0x01, 0x01, 0x01]);
+        assert!(resp_left.matches(&req_left), "DAV4 Pro normal left response has args[2]=1 and must match");
+
+        let req_back_hs = cmd::get_button_function(1, 0x04, true);
+        let req_fwd = cmd::get_button_function(1, 0x05, false);
+        let mut resp_back = req_back_hs.clone();
+        resp_back.status = 0x02;
+        resp_back.arguments[..6].copy_from_slice(&[0x01, 0x04, 0x00, 0x01, 0x01, 0x04]);
+        assert!(resp_back.matches(&req_back_hs), "DAV4 Pro hypershift back response has args[2]=0 and must match");
+        assert!(!resp_back.matches(&req_fwd), "stale response from another button must not match");
     }
 }

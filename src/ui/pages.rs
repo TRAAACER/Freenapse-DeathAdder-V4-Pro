@@ -9,9 +9,8 @@ use super::draw::theme::*;
 use super::draw::*;
 use super::{FontKind, Id, Kind, Layer, Page, TileArt, TileItem, Ui, Widget, display_model};
 use crate::accel::Mode;
-use crate::config::{MacroConfig, parse_button};
+use crate::config::parse_button;
 use crate::device::{CLICK_CODES, DONGLE_LED_SLOTS, DeviceSpec, DongleKind, PhysicalButton, TURBO_MAX, TURBO_MIN};
-use crate::macros::{self, Playback};
 
 /// Card padding, the label column of a settings row, and the row heights (DESIGN.md 3.3, 4.6).
 const PAD: i32 = 16;
@@ -481,16 +480,13 @@ fn button_icon(id: Id, label: &str) -> Option<Icon> {
     Some(match id {
         Id::GameScan | Id::Refresh => Icon::Refresh,
         Id::GameBrowse | Id::OpenConfig => Icon::Folder,
-        Id::GameRemove | Id::MacroDelete => Icon::Trash,
+        Id::GameRemove | Id::CurveRemove => Icon::Trash,
         Id::GameButtons => Icon::Mouse,
-        Id::MacroNew | Id::MacroRecord => Icon::Record,
-        Id::MacroStop => Icon::Stop,
         Id::Reimport => Icon::Sync,
         Id::Reapply => Icon::Check,
         Id::PairStart => Icon::Link,
         Id::PairCancel | Id::Unpair => Icon::Stop,
         Id::CurveAdd => Icon::Add,
-        Id::CurveRemove => Icon::Trash,
         Id::None if label.starts_with("Scanning") || label.starts_with("正在扫描") => Icon::Refresh,
         _ => return None,
     })
@@ -750,7 +746,7 @@ fn games(ui: &Ui, f: &mut Form) {
             "尚未添加游戏配置。点击下方已安装游戏封面（或“添加程序”），即可为该游戏独立指定 DPI 档位、回报率与按键映射；托盘程序会在游戏处于前台时自动切换。",
         );
     } else {
-        f.note("点击卡片展开设置。当游戏切到前台约 2 秒后，托盘程序会自动将对应配置写入鼠标，退出或切回桌面时自动恢复日常设置。");
+        f.note("点击卡片展开设置。当游戏处于前台时，托盘程序会自动将专属配置写入鼠标，退出或切回桌面时自动恢复日常设置。");
     }
     let mut tiles: Vec<TileItem> = cfg
         .games
@@ -964,8 +960,7 @@ fn power(ui: &Ui, f: &mut Form) {
     }
 }
 
-pub const CATEGORIES: [&str; 12] =
-    ["默认", "鼠标按键", "键盘按键", "DPI 切换", "多媒体", "桌面快捷", "系统与配置", "宏", "启动程序", "输入文本", "Hypershift", "禁用"];
+pub const CATEGORIES: [&str; 9] = ["默认", "鼠标按键", "键盘按键", "DPI 切换", "多媒体", "桌面快捷", "系统与配置", "Hypershift", "禁用"];
 pub const CAT_MOUSE: usize = 1;
 pub const CAT_KEYBOARD: usize = 2;
 pub const CAT_DPI: usize = 3;
@@ -973,13 +968,8 @@ pub const CAT_MEDIA: usize = 4;
 /// Common Windows & desktop shortcuts (Synapse 4 "Windows Shortcuts"), stored onboard as `key:...`.
 pub const CAT_SHORTCUT: usize = 5;
 pub const CAT_SYSTEM: usize = 6;
-pub const CAT_MACRO: usize = 7;
-/// Start a program: a one-step `launch:` macro played by the tray app.
-pub const CAT_LAUNCH: usize = 8;
-/// Type a text: a one-step `text:` macro played by the tray app.
-pub const CAT_TEXT: usize = 9;
-pub const CAT_HYPERSHIFT: usize = 10;
-pub const CAT_DISABLED: usize = 11;
+pub const CAT_HYPERSHIFT: usize = 7;
+pub const CAT_DISABLED: usize = 8;
 
 /// One-click Windows & desktop shortcuts matching Razer Synapse 4 ("Windows 快捷方式").
 /// Every entry uses canonical modifier order (`ctrl`, `shift`, `alt`, `win`) so onboard
@@ -1014,29 +1004,7 @@ pub fn shortcut_preset_of(spec: &str) -> Option<(&'static str, &'static str)> {
     SHORTCUT_PRESETS.iter().copied().find(|(_, s)| *s == target)
 }
 
-/// The single software step of a macro bound by the Program or Text function:
-/// (`launch` or `text`, its value), when the assignment is exactly that.
-pub fn software_step(spec: Option<&str>, macros_: &[MacroConfig]) -> Option<(&'static str, String)> {
-    let (id, _) = parse_button(spec?).ok().flatten().and_then(|f| f.macro_binding())?;
-    let m = macros_.iter().find(|m| m.id == id)?;
-    if m.events.len() != 1 {
-        return None;
-    }
-    if let Some(p) = m.events[0].strip_prefix("launch:") {
-        return Some(("launch", p.to_string()));
-    }
-    if let Some(t) = m.events[0].strip_prefix("text:") {
-        return Some(("text", t.to_string()));
-    }
-    None
-}
-
-pub fn category_of(spec: Option<&str>, macros_: &[MacroConfig]) -> usize {
-    match software_step(spec, macros_) {
-        Some(("launch", _)) => return CAT_LAUNCH,
-        Some(("text", _)) => return CAT_TEXT,
-        _ => {}
-    }
+pub fn category_of(spec: Option<&str>) -> usize {
     match spec {
         None | Some("default") => 0,
         Some(s) if s.starts_with("mouse:") || s.starts_with("turbo:") || s == "double-click" => CAT_MOUSE,
@@ -1046,33 +1014,9 @@ pub fn category_of(spec: Option<&str>, macros_: &[MacroConfig]) -> usize {
         Some(s) if s.starts_with("profile-") => CAT_SYSTEM,
         Some(s) if s.starts_with("media:") => CAT_MEDIA,
         Some(s) if s.starts_with("system:") => CAT_SYSTEM,
-        Some(s) if s.starts_with("macro") => CAT_MACRO,
         Some("hypershift") => CAT_HYPERSHIFT,
         Some("disabled") => CAT_DISABLED,
         _ => 0,
-    }
-}
-
-/// Playback options in the order of the chips on the Customize page.
-pub const PLAYBACKS: [&str; 5] = ["播放一次", "指定次数", "按住循环", "切换开关", "按步顺序"];
-
-fn playback_label_zh(p: Playback) -> String {
-    match p {
-        Playback::Times(1) => "单次".into(),
-        Playback::Times(n) => format!("{n} 次"),
-        Playback::Held => "按住循环".into(),
-        Playback::Toggle => "切换开关".into(),
-        Playback::Sequence => "步进序列".into(),
-    }
-}
-
-pub fn playback_index(p: Playback) -> usize {
-    match p {
-        Playback::Times(1) => 0,
-        Playback::Times(_) => 1,
-        Playback::Held => 2,
-        Playback::Toggle => 3,
-        Playback::Sequence => 4,
     }
 }
 
@@ -1187,12 +1131,12 @@ fn pretty_button(name: &str) -> String {
 
 /// What a button does out of the box on the mouse whose buttons these are: a click is
 /// itself, anything else is named after the function the table has for it.
-fn default_label(own: &str, buttons: &[PhysicalButton], macros_: &[MacroConfig]) -> String {
+fn default_label(own: &str, buttons: &[PhysicalButton]) -> String {
     let Some(b) = buttons.iter().find(|b| b.name == own).filter(|_| crate::device::button_code(own).is_none()) else {
         return pretty_button(own);
     };
     match (crate::config::spec_for(&b.default), b.default.0) {
-        (Some(spec), _) => pretty_spec(Some(&spec), own, buttons, macros_),
+        (Some(spec), _) => pretty_spec(Some(&spec), own, buttons),
         // Functions the config has no value for (the Basilisk V3's scroll-mode button and tilts).
         (None, [0x12, ..]) => "滚轮模式切换".into(),
         (None, [0x0e, _, 0x68, ..]) => "向左滚动".into(),
@@ -1202,24 +1146,15 @@ fn default_label(own: &str, buttons: &[PhysicalButton], macros_: &[MacroConfig])
 }
 
 /// Human description of an assignment for the button list.
-pub fn pretty_spec(spec: Option<&str>, own: &str, buttons: &[PhysicalButton], macros_: &[MacroConfig]) -> String {
+pub fn pretty_spec(spec: Option<&str>, own: &str, buttons: &[PhysicalButton]) -> String {
     if let Some(s) = spec {
         let (base, rate) = turbo_split(s);
         if let Some(n) = rate {
-            return format!("{} · 连发 {n} 次/秒", pretty_spec(Some(&base), own, buttons, macros_));
-        }
-        match software_step(spec, macros_) {
-            Some(("launch", p)) => return format!("启动程序：{}", macros::launch_label(&p)),
-            Some(("text", t)) => return format!("输入文本：{t}"),
-            _ => {}
-        }
-        if let Some((id, play)) = parse_button(s).ok().flatten().and_then(|f| f.macro_binding()) {
-            let name = macros_.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| format!("宏 {id}"));
-            return format!("宏：{name}（{}）", playback_label_zh(play));
+            return format!("{} · 连发 {n} 次/秒", pretty_spec(Some(&base), own, buttons));
         }
     }
     match spec {
-        None | Some("default") => format!("{} (默认)", default_label(own, buttons, macros_)),
+        None | Some("default") => format!("{} (默认)", default_label(own, buttons)),
         Some("disabled") => "已禁用".into(),
         Some("hypershift") => "Hypershift 组合层键".into(),
         Some("double-click") => "左键双击".into(),
@@ -1281,7 +1216,7 @@ fn customize(ui: &Ui, f: &mut Form) {
                 inherited = spec.is_some();
             }
         }
-        let mut sub = pretty_spec(spec, name, buttons, &cfg.macros);
+        let mut sub = pretty_spec(spec, name, buttons);
         if inherited {
             sub.push_str(" · 继承自标准层");
         }
@@ -1307,13 +1242,7 @@ fn customize(ui: &Ui, f: &mut Form) {
     let name = ui.sel().name;
     let key = ui.button_key();
     let spec = layer_buttons.get(&key).map(String::as_str);
-    let cat = if ui.key_mode.as_deref() == Some(key.as_str()) {
-        CAT_KEYBOARD
-    } else if ui.text_mode.as_deref() == Some(key.as_str()) {
-        CAT_TEXT
-    } else {
-        category_of(spec, &cfg.macros)
-    };
+    let cat = if ui.key_mode.as_deref() == Some(key.as_str()) { CAT_KEYBOARD } else { category_of(spec) };
     let (base, rate) = spec.map(turbo_split).unwrap_or((String::new(), None));
     let layer_title = match ui.layer {
         Layer::Normal => String::new(),
@@ -1348,116 +1277,9 @@ fn customize(ui: &Ui, f: &mut Form) {
             }
             f.note("支持键名：a-z、0-9、f1-f24、enter、esc、tab、space、backspace、delete、home、end、pageup、pagedown、up、down、left、right 及标点键。修饰键支持 ctrl、shift、alt、win，例如 ctrl+shift+c 或 win+d。");
         }
-        CAT_MACRO => {
-            let bound = spec.and_then(|s| parse_button(s).ok().flatten()).and_then(|f| f.macro_binding());
-            let names: Vec<String> = cfg.macros.iter().map(|m| m.name.clone()).collect();
-            let sel = bound.and_then(|(id, _)| cfg.macros.iter().position(|m| m.id == id));
-            f.chips_wide("选择要绑定的宏", &names, sel, Id::Option(0));
-            let play = bound.map(|(_, p)| p).unwrap_or(Playback::Times(1));
-            f.chips_wide("播放方式", &PLAYBACKS.map(String::from), Some(playback_index(play)), Id::MacroPlay);
-            if let Playback::Times(n) = play {
-                if n > 1 {
-                    f.slider("重复播放次数", "", 2, macros::TIMES_MAX as i32, 1, n as i32, |v| format!("{v} 次"), Id::MacroTimes);
-                }
-            }
-            if cfg.tray.onboard_only {
-                f.warning("当前已开启“纯板载反作弊模式”，软件宏触发与 SendInput 播放已停用（可在“软件设置”或托盘菜单中关闭）。");
-            } else if ui.macro_onboard == Some(true) {
-                f.note("该鼠标内置板载宏存储，宏无需后台软件即可脱机运行。");
-            } else {
-                f.note("炼狱蝰蛇 V4 Pro 无硬件宏闪存（与雷云 4 机制一致）：按键在鼠标内绑定为 F13..F24 触发键，按下时由轻量托盘程序拦截并执行宏，请保持托盘图标运行。");
-            }
-        }
-        CAT_LAUNCH => {
-            if cfg.tray.onboard_only {
-                f.warning("当前已开启“纯板载反作弊模式”，软件启动程序绑定已停用。");
-            }
-            match software_step(spec, &cfg.macros) {
-                Some((_, p)) => f.note(&format!("按下此键将启动：{p}。再次点击上方“启动程序”可重新选择。")),
-                None => f.note("在弹出的窗口中选择要启动的程序或文件。"),
-            }
-            f.note("启动程序由后台托盘响应执行（请保持托盘运行）。如仅需系统快捷键（如显示桌面），直接选“桌面快捷”或“键盘按键”即可板载脱机使用。");
-        }
-        CAT_TEXT => {
-            if cfg.tray.onboard_only {
-                f.warning("当前已开启“纯板载反作弊模式”，软件文本输入已停用。");
-            }
-            let cur = software_step(spec, &cfg.macros).filter(|(k, _)| *k == "text").map(|(_, t)| t).unwrap_or_default();
-            f.edit("要自动输入的文本", "输入后按 Enter 回车键保存", &cur, false, Id::TextEdit);
-            f.note("按下按键时由托盘程序通过 Unicode 直接输入任意中英文文本（不受当前输入法状态影响），请保持托盘运行。");
-        }
         CAT_HYPERSHIFT => f.note("按住此键不放时激活 Hypershift 第二层：其他所有按键将临时切换为第二层功能。"),
         CAT_DISABLED => f.note("禁用此物理按键（按下无任何响应；底部电源键长按 3 秒仍可正常开关机）。"),
-        _ => f.note("恢复该按键的出厂默认功能。普通按键、组合键、多媒体键与 DPI 切换均直写鼠标板载内存，无需后台软件即可在任何电脑上生效。"),
-    }
-
-    macros_section(ui, f);
-}
-
-/// Truncate a macro summary at a valid UTF-8 character boundary so multi-byte
-/// Chinese text macros never panic inside `String::truncate`.
-pub fn truncate_summary(mut sub: String, max_bytes: usize) -> String {
-    if sub.len() > max_bytes {
-        let end = macros::utf8_prefix(&sub, max_bytes.saturating_sub(3));
-        sub.truncate(end);
-        sub.push_str("...");
-    }
-    sub
-}
-
-/// The macro list with the recorder.
-fn macros_section(ui: &Ui, f: &mut Form) {
-    let cfg = &ui.cfg;
-    f.section_icon("宏录制与管理", Some(Icon::Keyboard));
-    if ui.is_recording() {
-        f.note(&format!(
-            "正在录制（已进行 {} 秒，记录 {} 个动作）：请按下键盘或鼠标按键（按键间隔延迟会一并记录），完成后点击“停止录制”或按 Esc。",
-            ui.rec_secs, ui.rec_count
-        ));
-        f.buttons(&[("停止录制", Id::MacroStop, true)]);
-        return;
-    }
-    if cfg.macros.is_empty() {
-        f.note("暂无宏。点击下方“录制新宏”，你按下的键盘按键、鼠标点击及停顿间隔都会被记录，随后可绑定到上方任意鼠标按键。");
-    }
-    for (i, m) in cfg.macros.iter().enumerate() {
-        let events = m.events().unwrap_or_default();
-        let bytes = macros::encode(&events).len();
-        let mut sub = truncate_summary(macros::describe(&events), 70);
-        if sub.is_empty() {
-            sub = "空宏".into();
-        }
-        f.push(
-            Id::SelectMacro(i),
-            f.x + PAD,
-            f.y,
-            f.w - 2 * PAD,
-            44,
-            Kind::Row { title: format!("{}  ·  编号 {}  ·  {} 字节", m.name, m.id, bytes), sub, selected: ui.sel_macro == Some(i) },
-        );
-        f.y += 48;
-    }
-    f.gap(4);
-    let has_sel = ui.sel_macro.is_some_and(|i| i < cfg.macros.len());
-    f.buttons(&[
-        ("录制新宏", Id::MacroNew, true),
-        ("重新录制选中宏", if has_sel { Id::MacroRecord } else { Id::None }, false),
-        ("删除宏", if has_sel { Id::MacroDelete } else { Id::None }, false),
-    ]);
-    if let Some(m) = ui.sel_macro.and_then(|i| cfg.macros.get(i)) {
-        f.edit("宏名称", "修改后按 Enter 回车键保存", &m.name, false, Id::MacroName);
-        let steps = m.events.join(", ");
-        f.note(&format!("动作序列：{steps}"));
-    }
-    match (ui.macro_onboard, ui.macro_storage) {
-        (Some(true), Some(st)) => {
-            f.note(&format!("鼠标板载宏空间：剩余 {} / {} 字节。也可在配置文件 [[macros]] 中手动精确编辑延迟毫秒。", st.available, st.total))
-        }
-        (Some(false), _) => f.note(&format!(
-            "当前鼠标无硬件宏闪存，宏由后台托盘低延迟播放（最多支持同时绑定 {} 组不同宏），也可在配置文件 [[macros]] 中精确编辑毫秒延迟。",
-            macros::MAX_SOFT_SLOTS
-        )),
-        _ => f.note("也可在配置文件 [[macros]] 中精确编辑每个步骤与延迟毫秒。"),
+        _ => f.note("恢复该按键的出厂默认功能。所有按键映射、组合键、多媒体键与 DPI 切换均直写鼠标板载内存，无需后台软件即可在任何电脑上生效。"),
     }
 }
 
@@ -1474,15 +1296,9 @@ fn app(ui: &Ui, f: &mut Form) {
     f.section_icon("系统托盘与开机静默自启", Some(Icon::Program));
     f.toggle(
         "开机静默自启到系统托盘",
-        "登录 Windows 时无弹窗、无控制台直接后台驻留托盘（状态栏电量图标、游戏自动切回报率、软件宏播放；若移动了 exe 位置会自动修复路径）",
+        "登录 Windows 时无弹窗、无控制台直接后台驻留托盘（状态栏电量图标与游戏自动切配置；若移动了 exe 位置会自动修复路径）",
         ui.autostart,
         Id::Autostart,
-    );
-    f.toggle(
-        "纯板载反作弊模式（禁用软件模拟输入）",
-        "彻底禁止挂载 WH_KEYBOARD_LL 键盘钩子与 SendInput 宏播放；纯板载改键、DPI、8K 回报率与进游戏自动切配置照常运行",
-        cfg.tray.onboard_only,
-        Id::OnboardOnly,
     );
     f.slider(
         "电量刷新间隔",
@@ -1737,11 +1553,10 @@ fn roadmap(f: &mut Form) {
     f.status(Done, "HyperPolling 单灯接收器模式", "兼容一代 HyperPolling 接收器");
     f.status(Partial, "接收器无线重新配对", "一代 HyperPolling 支持完整配对；二代半球形接收器对码暂需官方配对工具");
 
-    f.section("按键自定义与宏 (Customize)");
+    f.section("按键自定义 (Customize)");
     f.status(Done, "全按键映射（标准层 + Hypershift 层）", "左/右/中/前进/后退/滚轮上下/底部 DPI 键全部板载重映射");
+    f.status(Done, "桌面快捷预设（显示桌面 / 截图 / 锁屏等）", "硬件级直写系统组合键，无需后台软件永久生效");
     f.status(Done, "双击、连发 (Turbo)、多媒体与系统电源键", "1..50 次/秒硬件连发、音量静音、睡眠关机");
-    f.status(Done, "宏录制与五种播放模式", "单次 / N 次 / 按住循环 / 切换开关 / 步进序列");
-    f.status(Done, "一键启动程序与 Unicode 文本输入", "支持一键输入任意中文短语或打开程序/网页");
 
     f.section("软件体验");
     f.status(Done, "单文件免安装、零后台服务", "仅约 1 MB，内存占用约 10 MB，远离 1.5 GB 电子垃圾");
@@ -2016,7 +1831,7 @@ mod tests {
 
     #[test]
     fn a_default_is_named_after_the_mouse_that_has_the_button() {
-        let label = |own: &str, buttons: &[PhysicalButton]| pretty_spec(None, own, buttons, &[]);
+        let label = |own: &str, buttons: &[PhysicalButton]| pretty_spec(None, own, buttons);
         assert_eq!(label("left", BUTTONS), "左键 (默认)");
         assert_eq!(label("dpi", BUTTONS), "DPI 循环切换 (默认)");
         // The Basilisk V3 (issue 5): functions without a config value still get one name.
@@ -2026,7 +1841,7 @@ mod tests {
         assert_eq!(label("tilt-right", BASILISK_V3_BUTTONS), "向右滚动 (默认)");
         assert_eq!(label("clutch", BASILISK_V3_BUTTONS), "灵敏度离合 400 DPI (默认)");
         assert_eq!(label("clutch", BASILISK_V2_BUTTONS), "灵敏度离合 788 DPI (默认)");
-        assert_eq!(pretty_spec(Some("disabled"), "dpi", BASILISK_V3_BUTTONS, &[]), "已禁用");
+        assert_eq!(pretty_spec(Some("disabled"), "dpi", BASILISK_V3_BUTTONS), "已禁用");
     }
 
     #[test]
@@ -2034,19 +1849,10 @@ mod tests {
         for (label, spec) in SHORTCUT_PRESETS {
             let f = parse_button(spec).expect(spec).expect(spec);
             assert_eq!(crate::config::spec_for(&f).as_deref(), Some(spec), "canonical spec mismatch for {label}");
-            assert_eq!(category_of(Some(spec), &[]), CAT_SHORTCUT, "{label}");
+            assert_eq!(category_of(Some(spec)), CAT_SHORTCUT, "{label}");
         }
-        assert_eq!(category_of(Some("key:win+shift+s"), &[]), CAT_SHORTCUT);
-        assert_eq!(pretty_spec(Some("key:win+d"), "forward", BUTTONS, &[]), "快捷：显示桌面 (Win + D)");
-        assert_eq!(category_of(Some("key:f5"), &[]), CAT_KEYBOARD);
-    }
-
-    #[test]
-    fn chinese_text_macro_summary_truncates_on_char_boundary() {
-        let m = MacroConfig { id: 1, name: "中文短语".into(), events: vec![format!("text:{}", "中".repeat(30))] };
-        let desc = macros::describe(&m.events().unwrap());
-        assert!(desc.len() > 70 && !desc.is_char_boundary(67));
-        let out = truncate_summary(desc, 70);
-        assert!(out.ends_with("...") && out.len() <= 70 && out.contains('中'));
+        assert_eq!(category_of(Some("key:win+shift+s")), CAT_SHORTCUT);
+        assert_eq!(pretty_spec(Some("key:win+d"), "forward", BUTTONS), "快捷：显示桌面 (Win + D)");
+        assert_eq!(category_of(Some("key:f5")), CAT_KEYBOARD);
     }
 }

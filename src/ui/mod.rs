@@ -14,7 +14,6 @@
 mod art;
 mod draw;
 mod pages;
-mod record;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,11 +32,10 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::accel;
-use crate::config::{Config, GameConfig, MacroConfig, macro_spec, parse_button};
-use crate::device::{Battery, DONGLE_LED_SLOTS, DeviceSpec, DongleKind, DpiStages, MacroStorage, Mouse, PairedDevice, PhysicalButton};
+use crate::config::{Config, GameConfig, parse_button};
+use crate::device::{Battery, DONGLE_LED_SLOTS, DeviceSpec, DongleKind, DpiStages, Mouse, PairedDevice, PhysicalButton};
 use crate::hid::HidError;
 use crate::library::{self, Game};
-use crate::macros::{self, Playback};
 use crate::{apply, autostart, config_path, user_active};
 use draw::theme::*;
 use draw::*;
@@ -120,7 +118,6 @@ const CLASS_NAME: &str = "freenapse-settings";
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_TICK: usize = 1;
 const TIMER_BATTERY: usize = 2;
-const TIMER_RECORD: usize = 3;
 /// Pairing mode is cancelled after this long without a result.
 const PAIRING_SECS: u64 = 90;
 
@@ -187,7 +184,7 @@ impl Page {
     /// One line under the title.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Page::Customize => "8 键改键、Hypershift 第二层与宏录制，直写鼠标板载内存",
+            Page::Customize => "8 键改键与 Hypershift 第二层，直写鼠标板载内存",
             Page::Performance => "45K DPI 档位、动态灵敏度曲线、8000 Hz 回报率与传感器角度微调",
             Page::Calibration => "Focus Pro 45K 智能追踪与非对称抬起 / 着陆截断高度",
             Page::Power => "电池电量、休眠节能与无线接收器指示灯设置",
@@ -256,7 +253,6 @@ pub enum Id {
     DongleLedBright,
     NotifyPercent,
     PollSeconds,
-    OnboardOnly,
     Autostart,
     OpenConfig,
     Reimport,
@@ -267,16 +263,6 @@ pub enum Id {
     Category(usize),
     Option(usize),
     KeyEdit,
-    /// The text box of the Text function on the Customize page.
-    TextEdit,
-    MacroPlay,
-    MacroTimes,
-    SelectMacro(usize),
-    MacroNew,
-    MacroRecord,
-    MacroStop,
-    MacroDelete,
-    MacroName,
     /// A game profile's row (index into `cfg.games`): opens or closes its settings.
     GameRow(usize),
     /// An installed game without a profile (index into `Ui::library`): creates one.
@@ -493,8 +479,6 @@ enum Write {
     Profile,
     Lighting,
     Button(u8, bool),
-    Macro(u16),
-    MacroDelete(u16),
     Pair(PairAct),
 }
 
@@ -564,19 +548,8 @@ pub struct Ui {
     pub(crate) layer: Layer,
     /// Config key ("back", "hypershift.back") whose keyboard assignment is being typed.
     pub(crate) key_mode: Option<String>,
-    /// Button key whose Text function is being typed (the edit box shows before a text exists).
-    pub(crate) text_mode: Option<String>,
     pub(crate) autostart: bool,
     rotation_last: i8,
-    /// Macro selected in the MACROS list (index into `cfg.macros`).
-    pub(crate) sel_macro: Option<usize>,
-    /// Recording in progress, and the macro id it is for.
-    recording: Option<(record::Recorder, u16)>,
-    pub(crate) rec_count: usize,
-    pub(crate) rec_secs: u64,
-    pub(crate) macro_storage: Option<MacroStorage>,
-    /// Whether the mouse stores macros itself (false: the tray app plays them).
-    pub(crate) macro_onboard: Option<bool>,
     /// Game profile selected on the Games page (index into `cfg.games`).
     pub(crate) sel_game: usize,
     /// Whether the selected profile's settings are shown under its row.
@@ -754,15 +727,8 @@ unsafe fn create(owner: HWND) -> HWND {
         sel_button: 0,
         layer: Layer::Normal,
         key_mode: None,
-        text_mode: None,
         autostart: autostart::is_enabled(),
         rotation_last: 5,
-        sel_macro: None,
-        recording: None,
-        rec_count: 0,
-        rec_secs: 0,
-        macro_storage: None,
-        macro_onboard: None,
         sel_game: 0,
         game_open: false,
         scroll_to: None,
@@ -877,10 +843,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as i32;
-            if let Some((rec, _)) = ui.recording.as_mut() {
-                rec.scroll(delta > 0);
-                return 0;
-            }
             ui.scroll_by(-delta / 120 * ui.s(48));
             0
         }
@@ -914,7 +876,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER => {
             match wparam {
-                TIMER_RECORD => ui.record_tick(),
                 TIMER_TICK => ui.tick(),
                 TIMER_BATTERY => {
                     if user_active() {
@@ -929,11 +890,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             if wparam as u16 == VK_ESCAPE {
-                if ui.recording.is_some() {
-                    ui.stop_recording();
-                } else {
-                    DestroyWindow(hwnd);
-                }
+                DestroyWindow(hwnd);
             }
             0
         }
@@ -944,7 +901,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_TICK);
             KillTimer(hwnd, TIMER_BATTERY);
-            KillTimer(hwnd, TIMER_RECORD);
             if ui.pairing_since.is_some() {
                 // Runs after the window is gone; its result has nowhere to go and is dropped.
                 ui.io(|dev| {
@@ -1154,19 +1110,19 @@ impl Ui {
         self.cfg.dongle.brightness.or(self.dongle_bright)
     }
 
-    /// Firmware, serial, profiles, macro memory and the dongle's pairings.
+    /// Firmware, serial, profiles and the dongle's pairings.
     fn read_details(&mut self, ident: bool, pair: bool) {
         self.io(move |dev| {
             let Ok(m) = dev.mouse() else { return Box::new(|ui: &mut Ui| ui.reading = false) };
             let ident = ident.then(|| {
                 let gen2 = (m.is_wireless() && m.spec().dongle == DongleKind::Gen2Dome).then(|| (m.dongle_leds().ok(), m.dongle_led_brightness().ok()));
-                (m.firmware().ok(), m.dongle_firmware().ok(), gen2, m.serial().ok(), m.profiles().ok(), m.macro_storage().ok(), m.macro_support().ok())
+                (m.firmware().ok(), m.dongle_firmware().ok(), gen2, m.serial().ok(), m.profiles().ok())
             });
             let paired = if pair && m.is_wireless() { Some(m.paired_devices().ok()) } else { None };
             let auto = if paired.is_some() { dev.auto_pairing() } else { None };
             Box::new(move |ui: &mut Ui| {
                 ui.reading = false;
-                if let Some((fw, dfw, gen2, serial, profiles, storage, onboard)) = ident {
+                if let Some((fw, dfw, gen2, serial, profiles)) = ident {
                     ui.fw = fw;
                     ui.dongle_fw = dfw;
                     if let Some((leds, br)) = gen2 {
@@ -1175,8 +1131,6 @@ impl Ui {
                     }
                     ui.serial = serial;
                     ui.profiles = profiles;
-                    ui.macro_storage = storage;
-                    ui.macro_onboard = onboard;
                 }
                 if let Some(p) = paired {
                     ui.paired = p;
@@ -2434,35 +2388,6 @@ impl Ui {
                     Err(e) => self.set_status(&e, ERR),
                 }
             }
-            Id::TextEdit => {
-                if text.is_empty() {
-                    return;
-                }
-                // A one-step macro that the tray app types with the button.
-                let key = self.button_key();
-                let step = format!("text:{text}");
-                let label = if text.chars().count() > 24 { format!("{}...", text.chars().take(22).collect::<String>()) } else { text.clone() };
-                let id = self.cfg.ensure_step_macro(&step, &label);
-                let spec = macro_spec(id, Playback::Times(1));
-                self.text_mode = None;
-                if self.layer_buttons().get(&key) != Some(&spec) {
-                    self.layer_buttons_mut().insert(key, spec);
-                    let w = self.button_write();
-                    self.commit(w);
-                    return;
-                }
-            }
-            Id::MacroName => {
-                if let Some(m) = self.sel_macro.and_then(|i| self.cfg.macros.get_mut(i)) {
-                    let name = text.chars().take(60).collect::<String>();
-                    if !name.is_empty() && name != m.name {
-                        m.name = name;
-                        let id = m.id;
-                        self.commit(Write::Macro(id));
-                        return;
-                    }
-                }
-            }
             Id::GameExe => {
                 if let Some(g) = self.cfg.games.get_mut(self.sel_game) {
                     // A game found in a launcher is matched by its folder, so its program name may be empty.
@@ -2743,57 +2668,6 @@ impl Ui {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Macro recording
-    // ------------------------------------------------------------------
-
-    unsafe fn start_recording(&mut self, id: u16) {
-        self.recording = Some((record::Recorder::new(), id));
-        self.rec_count = 0;
-        self.rec_secs = 0;
-        SetTimer(self.hwnd, TIMER_RECORD, 10, None);
-        self.set_status("正在录制宏：请按下键盘或鼠标按键，完成后点击“停止录制”或按 Esc", WARN);
-        self.layout();
-        InvalidateRect(self.hwnd, ptr::null(), 0);
-    }
-
-    unsafe fn record_tick(&mut self) {
-        let hwnd = self.hwnd;
-        let Some((rec, _)) = self.recording.as_mut() else {
-            KillTimer(hwnd, TIMER_RECORD);
-            return;
-        };
-        rec.poll(hwnd);
-        let (n, secs) = (rec.events.len(), rec.elapsed_secs());
-        if n != self.rec_count || secs != self.rec_secs {
-            self.rec_count = n;
-            self.rec_secs = secs;
-            self.layout();
-            InvalidateRect(hwnd, ptr::null(), 0);
-        }
-    }
-
-    unsafe fn stop_recording(&mut self) {
-        KillTimer(self.hwnd, TIMER_RECORD);
-        let Some((rec, id)) = self.recording.take() else { return };
-        let events = rec.finish();
-        if events.is_empty() {
-            self.set_status("未录制到任何操作，宏保持不变", WARN);
-            self.layout();
-            InvalidateRect(self.hwnd, ptr::null(), 0);
-            return;
-        }
-        let specs = macros::event_specs(&events);
-        match self.cfg.macros.iter_mut().find(|m| m.id == id) {
-            Some(m) => m.events = specs,
-            None => {
-                self.cfg.macros.push(MacroConfig { id, name: format!("宏 {id}"), events: specs });
-                self.sel_macro = Some(self.cfg.macros.len() - 1);
-            }
-        }
-        self.commit(Write::Macro(id));
-    }
-
     unsafe fn changed(&mut self, id: Id, v: i32) {
         let write = match id {
             Id::None => return,
@@ -2931,68 +2805,6 @@ impl Ui {
                 let (base, _) = pages::turbo_split(&cur);
                 self.layer_buttons_mut().insert(key, pages::with_turbo(&base, Some(v as u8)));
                 self.button_write()
-            }
-            Id::MacroPlay | Id::MacroTimes => {
-                let key = self.button_key();
-                let Some(cur) = self.layer_buttons().get(&key).cloned() else { return };
-                let Some((mid, play)) = parse_button(&cur).ok().flatten().and_then(|f| f.macro_binding()) else { return };
-                let play = if id == Id::MacroTimes {
-                    Playback::Times(v.clamp(1, macros::TIMES_MAX as i32) as u8)
-                } else {
-                    match v {
-                        0 => Playback::Times(1),
-                        1 => Playback::Times(if let Playback::Times(n) = play { n.max(2) } else { 2 }),
-                        2 => Playback::Held,
-                        3 => Playback::Toggle,
-                        _ => Playback::Sequence,
-                    }
-                };
-                self.layer_buttons_mut().insert(key, macro_spec(mid, play));
-                self.button_write()
-            }
-            Id::SelectMacro(i) => {
-                self.sel_macro = Some(i.min(self.cfg.macros.len().saturating_sub(1)));
-                self.layout();
-                InvalidateRect(self.hwnd, ptr::null(), 0);
-                return;
-            }
-            Id::MacroNew => {
-                let id = self.cfg.next_macro_id();
-                self.start_recording(id);
-                return;
-            }
-            Id::MacroRecord => {
-                let Some(id) = self.sel_macro.and_then(|i| self.cfg.macros.get(i)).map(|m| m.id) else { return };
-                self.start_recording(id);
-                return;
-            }
-            Id::MacroStop => {
-                self.stop_recording();
-                return;
-            }
-            Id::MacroDelete => {
-                let Some(i) = self.sel_macro.filter(|i| *i < self.cfg.macros.len()) else { return };
-                let id = self.cfg.macros[i].id;
-                // Buttons bound to it go back to their default.
-                let bound: Vec<String> = self
-                    .cfg
-                    .buttons
-                    .iter()
-                    .filter(|(_, s)| parse_button(s).ok().flatten().and_then(|f| f.macro_binding()).map(|(m, _)| m) == Some(id))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for k in &bound {
-                    self.cfg.buttons.remove(k);
-                }
-                for g in &mut self.cfg.games {
-                    g.buttons.retain(|_, s| parse_button(s).ok().flatten().and_then(|f| f.macro_binding()).map(|(m, _)| m) != Some(id));
-                }
-                self.cfg.macros.remove(i);
-                self.sel_macro = if self.cfg.macros.is_empty() { None } else { Some(i.min(self.cfg.macros.len() - 1)) };
-                if !bound.is_empty() {
-                    // The onboard functions of the unbound buttons are rewritten by the delete.
-                }
-                Write::MacroDelete(id)
             }
             Id::GameRow(i) => {
                 // Clicking the open profile closes it.
@@ -3248,22 +3060,6 @@ impl Ui {
                 self.cfg.tray.poll_seconds = v.clamp(10, 600) as u32;
                 Write::None
             }
-            Id::OnboardOnly => {
-                let on = v == 1;
-                if self.cfg.tray.onboard_only == on {
-                    return;
-                }
-                self.cfg.tray.onboard_only = on;
-                self.set_status(
-                    if on {
-                        "已开启纯板载反作弊模式：已彻底禁用软件宏键盘钩子与 SendInput 模拟输入"
-                    } else {
-                        "已关闭纯板载模式：允许按需使用软件宏与文本输入"
-                    },
-                    ACCENT,
-                );
-                if self.cfg.soft_macro_slots().is_empty() { Write::None } else { Write::Button(0, false) }
-            }
             Id::Autostart => {
                 match autostart::set(v == 1) {
                     Ok(()) => {
@@ -3328,7 +3124,6 @@ impl Ui {
                 let c = (v as usize).min(pages::CATEGORIES.len() - 1);
                 let key = self.button_key();
                 self.key_mode = None;
-                self.text_mode = None;
                 let spec = match c {
                     0 => None,
                     pages::CAT_MOUSE => {
@@ -3347,34 +3142,6 @@ impl Ui {
                     pages::CAT_MEDIA => Some("media:play-pause".to_string()),
                     pages::CAT_SHORTCUT => Some("key:win+d".to_string()),
                     pages::CAT_SYSTEM => Some("system:sleep".to_string()),
-                    pages::CAT_MACRO => {
-                        let Some(m) = self.cfg.macros.first() else {
-                            self.set_status("尚未创建任何宏：请先在下方“宏录制”区域录制一个宏", WARN);
-                            self.layout();
-                            InvalidateRect(self.hwnd, ptr::null(), 0);
-                            return;
-                        };
-                        Some(macro_spec(m.id, Playback::Times(1)))
-                    }
-                    pages::CAT_LAUNCH => {
-                        // A one-step macro that the tray app plays: pick the program now.
-                        let Some(path) = self.open_dialog("选择按下此按键时要启动的程序", "程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0\0")
-                        else {
-                            self.layout();
-                            InvalidateRect(self.hwnd, ptr::null(), 0);
-                            return;
-                        };
-                        let step = format!("launch:{path}");
-                        let id = self.cfg.ensure_step_macro(&step, &crate::macros::launch_label(&path));
-                        Some(macro_spec(id, Playback::Times(1)))
-                    }
-                    pages::CAT_TEXT => {
-                        // Show the text box; nothing is written until a text is typed.
-                        self.text_mode = Some(key);
-                        self.layout();
-                        InvalidateRect(self.hwnd, ptr::null(), 0);
-                        return;
-                    }
                     pages::CAT_HYPERSHIFT => Some("hypershift".to_string()),
                     _ => Some("disabled".to_string()),
                 };
@@ -3391,25 +3158,16 @@ impl Ui {
             Id::Option(_) => {
                 let key = self.button_key();
                 let cur = self.layer_buttons().get(&key).cloned().unwrap_or_default();
-                let cat = pages::category_of(Some(&cur), &self.cfg.macros);
+                let cat = pages::category_of(Some(&cur));
                 let rate = pages::turbo_split(&cur).1;
-                if cat == pages::CAT_MACRO {
-                    // Keep the playback option, change the macro.
-                    let play = parse_button(&cur).ok().flatten().and_then(|f| f.macro_binding()).map(|(_, p)| p).unwrap_or(Playback::Times(1));
-                    if let Some(m) = self.cfg.macros.get(v as usize) {
-                        let spec = macro_spec(m.id, play);
-                        self.layer_buttons_mut().insert(key, spec);
-                    }
-                } else {
-                    let opts = pages::options_for(cat, self.cfg.dpi.stages.len());
-                    if let Some((_, spec)) = opts.get(v as usize) {
-                        let out = if cat == pages::CAT_SHORTCUT { spec.clone() } else { pages::with_turbo(spec, rate) };
-                        self.layer_buttons_mut().insert(key, out);
-                    }
+                let opts = pages::options_for(cat, self.cfg.dpi.stages.len());
+                if let Some((_, spec)) = opts.get(v as usize) {
+                    let out = if cat == pages::CAT_SHORTCUT { spec.clone() } else { pages::with_turbo(spec, rate) };
+                    self.layer_buttons_mut().insert(key, out);
                 }
                 self.button_write()
             }
-            Id::KeyEdit | Id::TextEdit | Id::GamesEdit | Id::MacroName | Id::GameExe | Id::GameName | Id::GameFilter => return,
+            Id::KeyEdit | Id::GamesEdit | Id::GameExe | Id::GameName | Id::GameFilter => return,
         };
         self.commit(write);
     }
@@ -3460,10 +3218,10 @@ impl Ui {
                         } else {
                             ui.last_good = ui.cfg.clone();
                         }
-                        ui.write_done(Write::DongleLeds, Ok(()), None, None, None);
+                        ui.write_done(Write::DongleLeds, Ok(()), None, None);
                     }
                     Err(e) => {
-                        ui.write_done(Write::DongleLeds, Err(e), None, None, None);
+                        ui.write_done(Write::DongleLeds, Err(e), None, None);
                     }
                 }
             })
@@ -3493,17 +3251,13 @@ impl Ui {
             self.io(move |dev| {
                 let result = dev.mouse().and_then(|m| Self::write_to(m, &cfg, write));
                 dev.check(&result);
-                // Pairing and macro changes also refresh what the window shows about them.
+                // Pairing changes also refresh what the window shows about them.
                 let paired = match (write, &result, dev.mouse.as_ref()) {
                     (Write::Pair(_), Ok(()), Some(m)) => Some(m.paired_devices().ok()),
                     _ => None,
                 };
                 let auto = if paired.is_some() { dev.auto_pairing() } else { None };
-                let storage = match (write, dev.mouse.as_ref()) {
-                    (Write::Macro(_) | Write::MacroDelete(_), Some(m)) => m.macro_storage().ok(),
-                    _ => None,
-                };
-                Box::new(move |ui: &mut Ui| unsafe { ui.write_done(write, result, paired, auto, storage) })
+                Box::new(move |ui: &mut Ui| unsafe { ui.write_done(write, result, paired, auto) })
             });
         } else if self.owner != 0 {
             PostMessageW(self.owner, WM_UI_CONFIG_CHANGED, 1, 0);
@@ -3562,27 +3316,15 @@ impl Ui {
                     apply::apply(m, &cfg, cfg.polling.rate)?;
                 }
                 Write::Button(code, hs) => {
-                    // A macro binding may shift the slot keys of other buttons: rewrite them all.
-                    apply::apply_game_buttons(m, &cfg, None)?;
-                    Self::write_hypershift_buttons(m, &cfg)?;
-                    let _ = (code, hs);
-                }
-                Write::Macro(id) => {
-                    if m.macro_support()? && !cfg.macro_needs_software(id) {
-                        if let Some(mc) = cfg.macro_by_id(id) {
-                            m.write_macro(id, &mc.name, &mc.bytes())?;
+                    if let Some(b) = m.spec().buttons.iter().find(|b| b.code == code) {
+                        let key = if hs { format!("hypershift.{}", b.name) } else { b.name.to_string() };
+                        let f = cfg.buttons.get(&key).and_then(|s| parse_button(s).ok().flatten()).unwrap_or(b.default);
+                        if let Some(current) = apply::current_button(m, b.code, b.name, hs, cfg.buttons.contains_key(&key))?
+                            && current != f
+                        {
+                            m.set_button(m.profile(), b.code, hs, f)?;
                         }
                     }
-                    // Otherwise (no macro memory, or text / launch steps) the tray app plays it;
-                    // it reloads the config after this commit.
-                }
-                Write::MacroDelete(id) => {
-                    if m.macro_support()? && m.macro_ids()?.contains(&id) {
-                        m.delete_macro(id)?;
-                    }
-                    // Buttons that pointed at it are back to their defaults in the config.
-                    apply::apply_game_buttons(m, &cfg, None)?;
-                    Self::write_hypershift_buttons(m, &cfg)?;
                 }
                 Write::Pair(act) => match act {
                     PairAct::Start => {
@@ -3599,14 +3341,7 @@ impl Ui {
     }
 
     /// Back on the window's thread after a write: status line, pending state, the tray app.
-    unsafe fn write_done(
-        &mut self,
-        write: Write,
-        result: Result<(), HidError>,
-        paired: Option<Option<Vec<PairedDevice>>>,
-        auto: Option<bool>,
-        storage: Option<MacroStorage>,
-    ) {
+    unsafe fn write_done(&mut self, write: Write, result: Result<(), HidError>, paired: Option<Option<Vec<PairedDevice>>>, auto: Option<bool>) {
         if let Write::Pair(act) = write {
             if result.is_ok() {
                 self.pairing_since = if act == PairAct::Start { Some(Instant::now()) } else { None };
@@ -3615,9 +3350,6 @@ impl Ui {
         if let Some(p) = paired {
             self.paired = p;
             self.auto_pair = auto;
-        }
-        if storage.is_some() {
-            self.macro_storage = storage;
         }
         let applied = match result {
             Ok(()) => {
@@ -3633,21 +3365,13 @@ impl Ui {
                     Write::DongleBright => "无线接收器指示灯亮度已保存",
                     Write::Profile => "已切换板载配置文件并写入全部设置",
                     Write::Button(..) => "按键映射已保存至鼠标板载内存",
-                    Write::Macro(_) => {
-                        if self.macro_onboard == Some(true) {
-                            "宏已存入鼠标板载内存"
-                        } else {
-                            "宏已保存：按下绑定按键时由托盘程序执行（请保持托盘运行）"
-                        }
-                    }
-                    Write::MacroDelete(_) => "宏已删除",
                     Write::Pair(PairAct::Start) => "接收器已进入配对模式：请靠近接收器将鼠标电源关开一次",
                     Write::Pair(PairAct::Cancel) => "已取消配对模式",
                     Write::Pair(PairAct::Unpair) => "已取消配对。如需重连请使用“配对设备”",
                     Write::Pair(PairAct::Auto(_)) => "自动配对设置已保存至接收器",
                     _ => "已保存至鼠标板载内存",
                 };
-                if matches!(write, Write::Pair(_) | Write::MacroDelete(_)) || msg == "已保存至鼠标板载内存" {
+                if matches!(write, Write::Pair(_)) || msg == "已保存至鼠标板载内存" {
                     self.set_status(msg, ACCENT);
                 } else {
                     self.set_notice("已保存至鼠标板载内存", msg, ACCENT);
@@ -3690,20 +3414,6 @@ impl Ui {
             PostMessageW(self.owner, WM_UI_CONFIG_CHANGED, applied as usize, 0);
         }
         self.repaint();
-    }
-
-    /// Write the Hypershift layer of the config (normal layer: `apply::apply_game_buttons`).
-    fn write_hypershift_buttons(m: &Mouse, cfg: &Config) -> Result<(), HidError> {
-        for b in m.spec().buttons {
-            let key = format!("hypershift.{}", b.name);
-            let f = cfg.buttons.get(&key).and_then(|s| parse_button(s).ok().flatten()).unwrap_or(b.default);
-            let f = apply::resolve(m, cfg, f)?;
-            let Some(current) = apply::current_button(m, b.code, b.name, true, cfg.buttons.contains_key(&key))? else { continue };
-            if current != f {
-                m.set_button(m.profile(), b.code, true, f)?;
-            }
-        }
-        Ok(())
     }
 
     /// Push the whole config once the mouse answers again (in the background).
@@ -3781,10 +3491,6 @@ impl Ui {
 
     pub(crate) fn fonts(&self) -> &Fonts {
         &self.fonts
-    }
-
-    pub(crate) fn is_recording(&self) -> bool {
-        self.recording.is_some()
     }
 }
 

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::accel::Mode;
 use crate::device::{ButtonFunction, mouse_button_name};
-use crate::macros::Playback;
 use crate::sensor::Tracking;
 
 pub const DEFAULT_TOML: &str = r#"# freenapse configuration for one Razer mouse (each mouse in the device table that has its
@@ -107,8 +106,6 @@ active = 1
 poll_seconds = 60
 # Pop a notification when the battery drops to this percentage.
 notify_percent = 15
-# Pure onboard anti-cheat mode: disables software macro hooks (WH_KEYBOARD_LL) and SendInput playback.
-onboard_only = false
 # Disabled by default in Freenapse-DeathAdder V4 Pro.
 check_updates = false
 
@@ -131,19 +128,7 @@ check_updates = false
 # dpi_stage = 3          # optional: DPI stage to activate (1..5)
 # polling = 8000         # optional: polling rate; omitted = polling.game_rate
 # [games.buttons]        # optional: button assignments for this game, same values as [buttons]
-# back = "macro:1"
-
-# Onboard macros (optional, one [[macros]] block each), stored in the mouse's macro memory and
-# bound with "macro:<id>" (play once), "macro:<id>:<n>" (n times), "macro-held:<id>",
-# "macro-toggle:<id>" or "macro-seq:<id>" in [buttons]. Steps: "press:<key>", "down:<key>", "up:<key>",
-# "click:<button>", "mouse-down:<button>", "mouse-up:<button>", "scroll:up|down", "delay:<ms>", "move:<dx>,<dy>",
-# and two that only the tray app can play, so a macro using them is never stored in the mouse:
-# "text:<anything to type>" and "launch:<program, file or URL>" (the Customize page's Program and Text
-# functions create these). Windows shortcuts need no macro: "key:win+d" and the like are onboard keys.
-# [[macros]]
-# id = 1
-# name = "Reload and jump"
-# events = ["press:r", "delay:80", "press:space"]
+# back = "key:f"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -161,7 +146,6 @@ pub struct Config {
     pub tray: TrayConfig,
     pub lighting: LightingConfig,
     pub games: Vec<GameConfig>,
-    pub macros: Vec<MacroConfig>,
 }
 
 /// `[lighting]`: one effect per LED zone and one brightness for all of them.
@@ -210,26 +194,6 @@ pub struct GameConfig {
     pub dpi_stage: Option<u8>,
     pub polling: Option<u16>,
     pub buttons: BTreeMap<String, String>,
-}
-
-/// An onboard macro: id, name and the steps in their text form (see [`crate::macros::parse_event`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct MacroConfig {
-    pub id: u16,
-    pub name: String,
-    pub events: Vec<String>,
-}
-
-impl MacroConfig {
-    pub fn events(&self) -> Result<Vec<crate::macros::Event>, String> {
-        crate::macros::parse_events(&self.events).map_err(|e| format!("macro {} ({}): {e}", self.id, self.name))
-    }
-
-    /// The bytes the mouse stores for this macro.
-    pub fn bytes(&self) -> Vec<u8> {
-        crate::macros::encode(&self.events().unwrap_or_default())
-    }
 }
 
 impl GameConfig {
@@ -436,8 +400,6 @@ impl UnverifiedAccess {
 pub struct TrayConfig {
     pub poll_seconds: u32,
     pub notify_percent: u8,
-    /// Disables software macro keyboard hooks (`WH_KEYBOARD_LL`) and `SendInput` playback.
-    pub onboard_only: bool,
     /// Ask GitHub once a day whether a newer release exists (the only network request).
     pub check_updates: bool,
 }
@@ -485,7 +447,7 @@ impl Default for DongleConfig {
 }
 impl Default for TrayConfig {
     fn default() -> Self {
-        TrayConfig { poll_seconds: 60, notify_percent: 15, onboard_only: false, check_updates: false }
+        TrayConfig { poll_seconds: 60, notify_percent: 15, check_updates: false }
     }
 }
 
@@ -598,21 +560,6 @@ impl Config {
         for (k, v) in &self.buttons {
             button_target(k)?;
             parse_button(v)?;
-            self.check_macro_ref(v)?;
-        }
-        let mut ids = Vec::new();
-        for m in &self.macros {
-            if m.id == 0 {
-                return Err("macro ids start at 1".into());
-            }
-            if ids.contains(&m.id) {
-                return Err(format!("macro id {} is used twice", m.id));
-            }
-            ids.push(m.id);
-            if m.name.len() > crate::macros::NAME_MAX {
-                return Err(format!("macro {} name is longer than {} bytes", m.id, crate::macros::NAME_MAX));
-            }
-            m.events()?;
         }
         if !self.has_left_click(None) {
             return Err("no button would be a left click: keep \"left\" at its default or assign mouse:left to another button".into());
@@ -621,9 +568,6 @@ impl Config {
             if !self.has_left_click(Some(g)) {
                 return Err(format!("[[games]] {}: no button would be a left click while it runs", g.label()));
             }
-        }
-        if self.soft_macro_slots().len() > crate::macros::MAX_SOFT_SLOTS {
-            return Err(format!("at most {} different macro bindings are supported", crate::macros::MAX_SOFT_SLOTS));
         }
         for g in &self.games {
             if g.exe.trim().is_empty() && g.dir.trim().is_empty() {
@@ -642,7 +586,6 @@ impl Config {
             for (k, v) in &g.buttons {
                 button_target(k).map_err(|e| format!("[[games]] {}: {e}", g.label()))?;
                 parse_button(v).map_err(|e| format!("[[games]] {}: {e}", g.label()))?;
-                self.check_macro_ref(v)?;
             }
         }
         Ok(())
@@ -659,18 +602,6 @@ impl Config {
                 Some(Err(_)) => false,
             }
         })
-    }
-
-    /// A button bound to a macro must point at a macro of this config.
-    fn check_macro_ref(&self, spec: &str) -> Result<(), String> {
-        if let Ok(Some(f)) = parse_button(spec) {
-            if let Some((id, _)) = f.macro_binding() {
-                if !self.macros.iter().any(|m| m.id == id) {
-                    return Err(format!("button assignment '{spec}' refers to macro {id}, which is not in [[macros]]"));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Overrides for the program in the foreground, if any. `path` is its full
@@ -714,138 +645,6 @@ impl Config {
             dpi_stage: None,
             buttons: BTreeMap::new(),
         }
-    }
-
-    /// The macro with this id.
-    pub fn macro_by_id(&self, id: u16) -> Option<&MacroConfig> {
-        self.macros.iter().find(|m| m.id == id)
-    }
-
-    /// True when the macro has steps only the tray app can play (text, launch).
-    pub fn macro_needs_software(&self, id: u16) -> bool {
-        self.macro_by_id(id).and_then(|m| m.events().ok()).is_some_and(|ev| crate::macros::needs_software(&ev))
-    }
-
-    /// The macro that is exactly this one software step (what the Program and
-    /// Text functions of the Customize page bind), if the config has one.
-    pub fn macro_for_step(&self, step: &str) -> Option<u16> {
-        self.macros.iter().find(|m| m.events.len() == 1 && m.events[0] == step).map(|m| m.id)
-    }
-
-    /// Bind a single software step to a button: reuse the macro that is just
-    /// that step, or add one named after it. Returns the macro id.
-    pub fn ensure_step_macro(&mut self, step: &str, name: &str) -> u16 {
-        if let Some(id) = self.macro_for_step(step) {
-            return id;
-        }
-        let id = self.next_macro_id();
-        self.macros.push(MacroConfig { id, name: name.to_string(), events: vec![step.to_string()] });
-        id
-    }
-
-    /// Every distinct (macro, playback) binding in the config, in a fixed order:
-    /// slot i is played by the key F13 + i on mice without macro memory.
-    pub fn soft_macro_slots(&self) -> Vec<(u16, Playback)> {
-        let mut slots: Vec<(u16, Playback)> = Vec::new();
-        let specs = self.buttons.values().chain(self.games.iter().flat_map(|g| g.buttons.values()));
-        for s in specs {
-            if let Some(b) = parse_button(s).ok().flatten().and_then(|f| f.macro_binding()) {
-                if !slots.contains(&b) {
-                    slots.push(b);
-                }
-            }
-        }
-        slots
-    }
-
-    /// Bitmask of `soft_macro_slots()` (`0..MAX_SOFT_SLOTS`) active in the current foreground
-    /// layout (`game_key = None` for desktop, `Some(key)` for an active game profile).
-    /// Returns `0` immediately when `tray.onboard_only` is enabled.
-    pub fn active_soft_slot_mask(&self, game_key: Option<&str>, onboard_macros: bool) -> u16 {
-        if self.tray.onboard_only {
-            return 0;
-        }
-        let slots = self.soft_macro_slots();
-        if slots.is_empty() {
-            return 0;
-        }
-        let over = game_key.and_then(|k| self.game_by_key(k));
-        let mut active_specs: Vec<&str> = Vec::new();
-        let mut has_hypershift = false;
-        for (k, v) in &self.buttons {
-            if k.starts_with("hypershift.") {
-                continue;
-            }
-            let eff = over.as_ref().and_then(|g| g.buttons.get(k)).unwrap_or(v).as_str();
-            if eff == "hypershift" {
-                has_hypershift = true;
-            }
-            active_specs.push(eff);
-        }
-        if let Some(g) = &over {
-            for (k, v) in &g.buttons {
-                if !k.starts_with("hypershift.") && !self.buttons.contains_key(k) {
-                    if v == "hypershift" {
-                        has_hypershift = true;
-                    }
-                    active_specs.push(v.as_str());
-                }
-            }
-        }
-        if has_hypershift {
-            for (k, v) in &self.buttons {
-                if k.starts_with("hypershift.") {
-                    let eff = over.as_ref().and_then(|g| g.buttons.get(k)).unwrap_or(v).as_str();
-                    active_specs.push(eff);
-                }
-            }
-            if let Some(g) = &over {
-                for (k, v) in &g.buttons {
-                    if k.starts_with("hypershift.") && !self.buttons.contains_key(k) {
-                        active_specs.push(v.as_str());
-                    }
-                }
-            }
-        }
-        let mut mask = 0u16;
-        for s in active_specs {
-            if let Some(b) = parse_button(s).ok().flatten().and_then(|f| f.macro_binding()) {
-                let is_soft = !onboard_macros || self.macro_needs_software(b.0);
-                if is_soft {
-                    if let Some(pos) = slots.iter().position(|x| *x == b) {
-                        if pos < crate::macros::MAX_SOFT_SLOTS {
-                            mask |= 1u16 << pos;
-                        }
-                    }
-                }
-            }
-        }
-        mask
-    }
-
-    /// The function actually written for a button: macro bindings become the
-    /// slot key (F13..F24) when the mouse has no macro memory.
-    pub fn resolve_button(&self, f: ButtonFunction, onboard_macros: bool) -> ButtonFunction {
-        // A macro with text or launch steps is software even where macro memory exists.
-        let software = f.macro_binding().is_some_and(|(id, _)| self.macro_needs_software(id));
-        if onboard_macros && !software {
-            return f;
-        }
-        if self.tray.onboard_only && f.macro_binding().is_some() {
-            return ButtonFunction::DISABLED;
-        }
-        match f.macro_binding() {
-            Some(b) => match self.soft_macro_slots().iter().position(|s| *s == b).and_then(crate::macros::soft_key_usage) {
-                Some(usage) => ButtonFunction::key(0, usage),
-                None => f,
-            },
-            None => f,
-        }
-    }
-
-    /// Lowest unused macro id.
-    pub fn next_macro_id(&self) -> u16 {
-        (1..=u16::MAX).find(|id| !self.macros.iter().any(|m| m.id == *id)).unwrap_or(1)
     }
 
     /// The sensor tracking setup described by `[sensor]`, validated. `None` = "keep".
@@ -898,7 +697,6 @@ impl Config {
             ("[profile]", "active", self.profile.active.to_string()),
             ("[tray]", "poll_seconds", self.tray.poll_seconds.to_string()),
             ("[tray]", "notify_percent", self.tray.notify_percent.to_string()),
-            ("[tray]", "onboard_only", self.tray.onboard_only.to_string()),
             ("[tray]", "check_updates", self.tray.check_updates.to_string()),
         ];
         let mut out = String::new();
@@ -975,10 +773,6 @@ impl Config {
                     out.push_str(&format!("{zone} = {v:?}\n"));
                 }
             }
-        }
-        for m in &self.macros {
-            let events: Vec<String> = m.events.iter().map(|e| format!("{e:?}")).collect();
-            out.push_str(&format!("\n[[macros]]\nid = {}\nname = {:?}\nevents = [{}]\n", m.id, m.name, events.join(", ")));
         }
         out
     }
@@ -1072,24 +866,6 @@ pub fn parse_button(spec: &str) -> Result<Option<ButtonFunction>, String> {
         let Some(ButtonFunction(d)) = parse_button(&format!("key:{k}"))? else { unreachable!() };
         return Ok(Some(ButtonFunction::turbo_key(d[2], d[3], turbo_rate(n)?)));
     }
-    for (prefix, play) in [("macro-held:", Playback::Held), ("macro-toggle:", Playback::Toggle), ("macro-seq:", Playback::Sequence)] {
-        if let Some(id) = spec.strip_prefix(prefix) {
-            return Ok(Some(ButtonFunction::macro_play(macro_id(id)?, play)));
-        }
-    }
-    if let Some(rest) = spec.strip_prefix("macro:") {
-        let (id, times) = match rest.split_once(':') {
-            Some((id, n)) => {
-                let n: u8 = n.trim().parse().map_err(|_| format!("bad macro repeat count '{n}'"))?;
-                if n == 0 {
-                    return Err("macro repeat count must be at least 1".into());
-                }
-                (id, n)
-            }
-            None => (rest, 1),
-        };
-        return Ok(Some(ButtonFunction::macro_play(macro_id(id)?, Playback::Times(times))));
-    }
     if let Some(n) = spec.strip_prefix("dpi-stage:") {
         let n: u8 = n.parse().map_err(|_| format!("bad dpi stage '{n}'"))?;
         if !(1..=5).contains(&n) {
@@ -1134,25 +910,6 @@ pub fn parse_button(spec: &str) -> Result<Option<ButtonFunction>, String> {
         return Ok(Some(ButtonFunction::key(mods, key)));
     }
     Err(format!("unknown button assignment '{spec}'"))
-}
-
-fn macro_id(s: &str) -> Result<u16, String> {
-    let id: u16 = s.trim().parse().map_err(|_| format!("bad macro id '{s}'"))?;
-    if id == 0 {
-        return Err("macro ids start at 1".into());
-    }
-    Ok(id)
-}
-
-/// Config text of a macro binding, e.g. `macro:3`, `macro:3:5`, `macro-held:3`.
-pub fn macro_spec(id: u16, play: Playback) -> String {
-    match play {
-        Playback::Times(1) => format!("macro:{id}"),
-        Playback::Times(n) => format!("macro:{id}:{n}"),
-        Playback::Held => format!("macro-held:{id}"),
-        Playback::Toggle => format!("macro-toggle:{id}"),
-        Playback::Sequence => format!("macro-seq:{id}"),
-    }
 }
 
 fn turbo_rate(s: &str) -> Result<u8, String> {
@@ -1287,10 +1044,6 @@ pub fn spec_for(f: &ButtonFunction) -> Option<String> {
         },
         0x07 => PROFILE_OPS.iter().find(|(_, op)| *op == d[2])?.0.to_string(),
         0x0c => "hypershift".to_string(),
-        0x03..=0x05 | 0x0f => {
-            let (id, play) = f.macro_binding()?;
-            macro_spec(id, play)
-        }
         _ => return None,
     })
 }
@@ -1547,10 +1300,8 @@ mod tests {
         c.sensor.rotation = -5;
         c.buttons.insert("back".into(), "dpi-up".into());
         c.buttons.insert("hypershift.forward".into(), "key:ctrl+c".into());
-        c.buttons.insert("middle".into(), "macro:2:3".into());
-        c.macros.push(MacroConfig { id: 2, name: "Reload \"fast\"".into(), events: vec!["press:r".into(), "delay:80".into()] });
         let mut g = GameConfig { exe: "cs2.exe".into(), dpi_stage: Some(1), polling: Some(4000), ..Default::default() };
-        g.buttons.insert("back".into(), "macro-held:2".into());
+        g.buttons.insert("back".into(), "key:j".into());
         c.games.push(g);
         c.games.push(GameConfig { exe: "valorant.exe".into(), ..Default::default() });
         c.games.push(GameConfig {
@@ -1574,30 +1325,6 @@ mod tests {
         assert!(c.game_for("C:\\Steam\\steamapps\\common\\rocketleague2\\x.exe").is_none());
         c.polling.games = vec!["Old.exe".into()];
         assert_eq!(c.game_by_key(&c.game_for("old.exe").unwrap().key).unwrap().polling, 8000);
-        assert_eq!(c.next_macro_id(), 1);
-    }
-
-    #[test]
-    fn macro_specs() {
-        for (spec, f) in [
-            ("macro:3", ButtonFunction([0x03, 3, 0, 3, 1, 0, 0])),
-            ("macro:3:5", ButtonFunction([0x03, 3, 0, 3, 5, 0, 0])),
-            ("macro-held:300", ButtonFunction([0x04, 2, 1, 44, 0, 0, 0])),
-            ("macro-toggle:3", ButtonFunction([0x05, 2, 0, 3, 0, 0, 0])),
-            ("macro-seq:3", ButtonFunction([0x0f, 2, 0, 3, 0, 0, 0])),
-        ] {
-            assert_eq!(parse_button(spec).unwrap(), Some(f), "{spec}");
-            assert_eq!(spec_for(&f).as_deref(), Some(spec), "{spec}");
-        }
-        assert!(parse_button("macro:0").is_err());
-        assert!(parse_button("macro:1:0").is_err());
-        let mut c = Config::default();
-        c.buttons.insert("back".into(), "macro:1".into());
-        assert!(c.validate().is_err(), "macro reference without a macro");
-        c.macros.push(MacroConfig { id: 1, name: "x".into(), events: vec!["press:a".into()] });
-        c.validate().unwrap();
-        c.macros.push(MacroConfig { id: 1, name: "y".into(), events: vec![] });
-        assert!(c.validate().is_err(), "duplicate id");
     }
 
     #[test]
@@ -1613,33 +1340,6 @@ mod tests {
         g.buttons.insert("back".into(), "key:c".into());
         c.games.push(g);
         assert!(c.validate().is_err(), "game layer loses the only left click");
-    }
-
-    #[test]
-    fn soft_slots() {
-        let mut c = Config::default();
-        c.macros.push(MacroConfig { id: 1, name: "a".into(), events: vec!["press:a".into()] });
-        c.macros.push(MacroConfig { id: 2, name: "b".into(), events: vec!["press:b".into()] });
-        c.buttons.insert("back".into(), "macro:2".into());
-        c.buttons.insert("forward".into(), "macro-held:1".into());
-        c.buttons.insert("hypershift.back".into(), "macro:2".into());
-        assert_eq!(c.soft_macro_slots(), vec![(2, Playback::Times(1)), (1, Playback::Held)]);
-        let f = parse_button("macro-held:1").unwrap().unwrap();
-        assert_eq!(c.resolve_button(f, false), ButtonFunction::key(0, 0x69));
-        assert_eq!(c.resolve_button(f, true), f);
-        let plain = parse_button("mouse:left").unwrap().unwrap();
-        assert_eq!(c.resolve_button(plain, false), plain);
-
-        // A launch or text macro is software even on a mouse with macro memory.
-        let id = c.ensure_step_macro("launch:C:/Tools/obs64.exe", "obs64.exe");
-        assert_eq!(id, 3);
-        assert_eq!(c.ensure_step_macro("launch:C:/Tools/obs64.exe", "again"), 3, "reused, not duplicated");
-        assert!(c.macro_needs_software(3));
-        assert!(!c.macro_needs_software(1));
-        c.buttons.insert("middle".into(), "macro:3".into());
-        let f = parse_button("macro:3").unwrap().unwrap();
-        assert_eq!(c.resolve_button(f, true), ButtonFunction::key(0, 0x6a), "third slot: F15");
-        assert_eq!(c.resolve_button(parse_button("macro-held:1").unwrap().unwrap(), true), parse_button("macro-held:1").unwrap().unwrap());
     }
 
     #[test]
@@ -1704,23 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn active_soft_slots_isolate_per_game_and_onboard_only() {
-        let mut c = Config::default();
-        c.macros.push(MacroConfig { id: 1, name: "Text".into(), events: vec!["text:hi".into()] });
-        c.buttons.insert("back".into(), "macro-toggle:1".into());
-        let mut game = GameConfig { name: "Shooter".into(), dir: "C:\\Games\\Shooter".into(), ..Default::default() };
-        game.buttons.insert("back".into(), "key:r".into());
-        let key = game.key();
-        c.games.push(game);
-
-        // Desktop uses slot 0 (F13); the game profile overrides `back` with onboard `key:r` -> active mask is 0!
-        assert_eq!(c.active_soft_slot_mask(None, false), 0b1);
-        assert_eq!(c.active_soft_slot_mask(Some(&key), false), 0);
-
-        // Pure onboard anti-cheat mode zeroes active software slots everywhere and resolves macro to DISABLED.
-        c.tray.onboard_only = true;
-        assert_eq!(c.active_soft_slot_mask(None, false), 0);
-        let mf = parse_button("macro-toggle:1").unwrap().unwrap();
-        assert_eq!(c.resolve_button(mf, false), ButtonFunction::DISABLED);
+    fn legacy_removed_keys_are_ignored_gracefully() {
+        let legacy: Config = toml::from_str("[tray]\nonboard_only = true\n[[macros]]\nid = 1\nname = 'old'\nevents = ['press:a']\n").unwrap();
+        legacy.validate().unwrap();
     }
 }

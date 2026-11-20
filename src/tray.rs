@@ -1,25 +1,30 @@
-//! Tray application: battery icon, DPI stage / polling rate switching,
-//! per-game profiles, software macros, low-battery notification. Pure Win32.
+//! Tray application: battery icon, event-driven per-game onboard profiles,
+//! and low-battery notifications. Pure Win32, zero global input hooks.
 //! Started by `freenapse.exe` when it is launched without arguments.
 
 #![allow(non_snake_case, unsafe_op_in_unsafe_fn)]
 
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::time::Instant;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+use windows_sys::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Config;
-use crate::device::{Battery, DpiStages, Mouse, RATES_HYPERPOLLING};
+use crate::device::{Battery, ButtonFunction, DeviceSpec, DpiStages, Mouse};
+use crate::hid::HidError;
 use crate::{apply, config_path, ui, user_active};
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -41,20 +46,23 @@ const TIMER_ICON: usize = 7;
 const WM_CONFIG_FILE: u32 = WM_APP + 6;
 /// Posted by the update thread: lparam is a `Box<String>` with the newer tag, or 0.
 const WM_UPDATE_RESULT: u32 = WM_APP + 7;
+/// Posted by the tray device worker thread when one or more [`WorkerReport`]s are queued.
+const WM_WORKER_REPORT: u32 = WM_APP + 8;
 
 const ID_QUIT: usize = 1;
-const ID_APPLY: usize = 2;
-const ID_OPEN_CONFIG: usize = 3;
-const ID_REFRESH: usize = 4;
-const ID_SETTINGS: usize = 5;
-const ID_UPDATE: usize = 6;
-const ID_AUTOSTART: usize = 7;
-const ID_ONBOARD_ONLY: usize = 8;
-const ID_STAGE_BASE: usize = 100;
-const ID_POLL_BASE: usize = 200;
+const ID_SETTINGS: usize = 2;
+const ID_AUTOSTART: usize = 3;
+const ID_UPDATE: usize = 4;
 
+const RETRY_DEFER_MS: u32 = 200;
 const RETRY_BASE_MS: u32 = 1200;
 const RETRY_MAX_MS: u32 = 4800;
+
+/// Poll step and quiet/timeout bounds (ms) of the shortcut/button release fence.
+const FENCE_STEP_MS: u64 = 15;
+const FENCE_QUIET_HELD_MS: u64 = 120;
+const FENCE_QUIET_WIN_MS: u64 = 60;
+const FENCE_MAX_WAIT_MS: u64 = 2400;
 
 /// Pure per-game profile state machine, separated from Win32/HID for deterministic testing.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -65,8 +73,6 @@ struct GameSync {
     dirty: bool,
     /// User's DPI stage before the first game DPI override took effect; restored when leaving DPI-overridden games.
     stage_before_game: Option<u8>,
-    /// Consecutive transient `GetForegroundWindow() == 0` checks (bounded to 3 before treating as desktop).
-    fg_empty_retries: u8,
 }
 
 impl GameSync {
@@ -107,14 +113,87 @@ impl GameSync {
     }
 }
 
+/// Confirmed hardware state cached by the device worker, field by field.
+/// Unknown (`None`) fields are read once from hardware; known matching fields skip both GET and SET.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct HwCache {
+    polling: Option<u16>,
+    stages: Option<DpiStages>,
+    /// Per physical button code: `Some(f)` = confirmed function, `None` = button absent on this unit.
+    buttons: BTreeMap<u8, Option<ButtonFunction>>,
+}
+
+impl HwCache {
+    fn clear(&mut self) {
+        self.polling = None;
+        self.stages = None;
+        self.buttons.clear();
+    }
+
+    /// Populate known base-layout values right after a full `apply::apply` succeeded on a verified mouse.
+    fn seed_from_base(&mut self, spec: &DeviceSpec, cfg: &Config, polling: u16, stages: Option<DpiStages>) {
+        self.polling = Some(polling);
+        self.stages = stages;
+        if spec.verified {
+            for b in spec.buttons {
+                let (func, _) = apply::normal_button_target(cfg, None, b);
+                self.buttons.insert(b.code, Some(func));
+            }
+        } else {
+            self.buttons.clear();
+        }
+    }
+}
+
+/// Coalesced desired state shared between the non-blocking Win32 tray thread and the single HID worker thread.
+struct WorkerGoal {
+    /// Incremented whenever `wanted_game`, `config`, or device state changes; cancels stale in-flight switches.
+    epoch: u64,
+    quit: bool,
+    reopen: bool,
+    unplugged: Option<String>,
+    cache_rev: u64,
+    config: Config,
+    config_ok: bool,
+    need_import: bool,
+    need_base_apply: bool,
+    notify_disk_reload: bool,
+    wanted_game: Option<String>,
+    has_game_rules: bool,
+    wake_probe: bool,
+    want_refresh: bool,
+}
+
+enum WorkerReport {
+    Device { connected: bool, model_name: Option<String>, config_file: std::path::PathBuf, unplugged_error: bool },
+    Imported(Box<Result<Config, String>>),
+    Refresh { base_applied: Option<usize>, from_disk_reload: bool, result: Result<(Battery, Option<DpiStages>, Option<u16>), HidError> },
+    Game { epoch: u64, applied: Option<String>, dirty: bool, deferred: bool, polling: Option<u16>, stages: Option<DpiStages>, error: Option<String> },
+}
+
+struct WorkerShared {
+    goal: Mutex<WorkerGoal>,
+    cvar: Condvar,
+    reports: Mutex<VecDeque<WorkerReport>>,
+}
+
+impl WorkerShared {
+    fn push_report(&self, hwnd: HWND, r: WorkerReport) {
+        self.reports.lock().unwrap_or_else(|e| e.into_inner()).push_back(r);
+        if hwnd != 0 {
+            unsafe { PostMessageW(hwnd, WM_WORKER_REPORT, 0, 0) };
+        }
+    }
+}
+
 struct App {
     hwnd: HWND,
     nid: NOTIFYICONDATAW,
     hicon: HICON,
     config: Config,
     config_error: Option<String>,
-    mouse: Option<Mouse>,
-    onboard_macros: bool,
+    mouse_connected: bool,
+    mouse_name: Option<String>,
     battery: Option<Battery>,
     stages: Option<DpiStages>,
     polling: Option<u16>,
@@ -123,7 +202,11 @@ struct App {
     need_import: bool,
     /// The file `config` was loaded from: another mouse has another file.
     config_file: std::path::PathBuf,
-    game: GameSync,
+    wanted_game: Option<String>,
+    game_applied: Option<String>,
+    game_dirty: bool,
+    game_deferred: bool,
+    fg_empty_retries: u8,
     notified_low: bool,
     last_error: Option<String>,
     last_refresh: Option<Instant>,
@@ -142,9 +225,11 @@ struct App {
     retry_ticks: u32,
     /// Current `TIMER_POLL` period in seconds.
     poll_secs: u32,
+    shared: Arc<WorkerShared>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
-static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -197,23 +282,48 @@ pub fn run(open_settings: bool) {
             }
         };
 
-        load_soft_macros(&config, None, true);
         let poll_secs = config.tray.poll_seconds.max(5);
+        let has_game_rules = !config.games.is_empty() || !config.polling.games.is_empty();
+        let config_ok = config_error.is_none();
+        let shared = Arc::new(WorkerShared {
+            goal: Mutex::new(WorkerGoal {
+                epoch: 1,
+                quit: false,
+                reopen: false,
+                unplugged: None,
+                cache_rev: 1,
+                config: config.clone(),
+                config_ok,
+                need_import,
+                need_base_apply: !need_import && config_ok,
+                notify_disk_reload: false,
+                wanted_game: None,
+                has_game_rules,
+                wake_probe: true,
+                want_refresh: true,
+            }),
+            cvar: Condvar::new(),
+            reports: Mutex::new(VecDeque::new()),
+        });
         let app = Box::new(App {
             hwnd: 0,
             nid: mem::zeroed(),
             hicon: 0,
             config,
             config_error,
-            mouse: None,
-            onboard_macros: true,
+            mouse_connected: false,
+            mouse_name: None,
             battery: None,
             stages: None,
             polling: None,
             config_applied: false,
             need_import,
             config_file: config_path(),
-            game: GameSync::default(),
+            wanted_game: None,
+            game_applied: None,
+            game_dirty: has_game_rules,
+            game_deferred: false,
+            fg_empty_retries: 0,
             notified_low: false,
             last_error: None,
             last_refresh: None,
@@ -226,6 +336,8 @@ pub fn run(open_settings: bool) {
             retry_ms: 0,
             retry_ticks: 0,
             poll_secs,
+            shared,
+            worker: None,
         });
         let app_ptr = Box::into_raw(app);
 
@@ -265,9 +377,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             ChangeWindowMessageFilterEx(hwnd, (*app).taskbar_created, MSGFLT_ALLOW, ptr::null_mut());
             (*app).add_icon();
             (*app).repair_autostart();
-            (*app).refresh();
             (*app).sync_fg_hooks();
             (*app).check_game();
+            (*app).start_worker();
             (*app).sync_retry_timer();
             let poll_ms = (*app).poll_secs * 1000;
             SetTimer(hwnd, TIMER_POLL, poll_ms, None);
@@ -290,10 +402,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             match wparam {
                 TIMER_POLL => {
-                    (*app).refresh();
-                    if (*app).game.dirty {
-                        (*app).check_game();
-                    }
+                    (*app).check_game();
+                    (*app).request_refresh();
                     (*app).sync_retry_timer();
                 }
                 TIMER_GAME => {
@@ -304,24 +414,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_RETRY => {
                     (*app).retry_ticks = (*app).retry_ticks.wrapping_add(1);
                     // RETRY_BASE_MS (1200 ms) < user_active() (1500 ms) so mouse wakes are never missed;
-                    // every 4th tick also probes once in case the mouse was already awake without cursor motion.
-                    if user_active() || (*app).retry_ticks.is_multiple_of(4) {
+                    // every 4th tick also probes once in case the mouse was already awake without cursor motion;
+                    // a deferred key-fence probes promptly on RETRY_DEFER_MS.
+                    if (*app).game_deferred || user_active() || (*app).retry_ticks.is_multiple_of(4) {
                         let need_base = (*app).need_import || (!(*app).config_applied && (*app).config_error.is_none()) || (*app).battery.is_none();
-                        if need_base {
-                            (*app).refresh();
-                        }
-                        if (*app).game.dirty {
+                        if (*app).game_dirty {
                             (*app).check_game();
                         }
+                        (*app).wake_worker(need_base);
                     }
                     (*app).sync_retry_timer();
                 }
                 TIMER_REPLUG => {
                     KillTimer(hwnd, TIMER_REPLUG);
-                    // The handle may be stale after a resume; a fresh open finds the device again.
-                    (*app).mouse = None;
+                    // The handle may be stale after a resume; tell the worker to reopen the device.
+                    (*app).mouse_connected = false;
                     (*app).battery = None;
-                    (*app).refresh();
+                    (*app).request_reopen();
                     (*app).check_game();
                     (*app).sync_retry_timer();
                 }
@@ -360,10 +469,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             TRAY_HWND.store(0, Ordering::Relaxed);
-            apply_active_soft_mask(0);
             let app = app_from(hwnd);
             if !app.is_null() {
                 (*app).unhook_fg();
+                (*app).stop_worker();
                 Shell_NotifyIconW(NIM_DELETE, &(*app).nid);
                 if (*app).hicon != 0 {
                     DestroyIcon((*app).hicon);
@@ -390,6 +499,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ui::open(hwnd);
                     0
                 }
+                WM_WORKER_REPORT => {
+                    (*app).drain_worker_reports();
+                    0
+                }
                 ui::WM_UI_CONFIG_CHANGED => {
                     // The settings window saved the config file (and wrote the mouse when wparam == 1).
                     match Config::load(&config_path()) {
@@ -399,17 +512,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         Err(e) => (*app).config_error = Some(e),
                     }
-                    load_soft_macros(&(*app).config, (*app).game.applied.as_deref(), (*app).onboard_macros);
                     (*app).sync_poll_timer();
                     (*app).sync_fg_hooks();
-                    if let Some(m) = (*app).mouse.as_mut() {
-                        m.set_write_access(&(*app).config);
-                    }
                     (*app).note_config_mtime();
                     (*app).config_applied = wparam == 1;
-                    // The config (and the mouse) now hold the base layout; a running game is re-detected.
-                    (*app).game.on_base_applied((*app).has_game_rules());
-                    (*app).refresh();
+                    (*app).game_applied = None;
+                    (*app).game_dirty = (*app).has_game_rules();
+                    (*app).push_config_to_worker(wparam != 1, false);
                     (*app).check_game();
                     (*app).sync_retry_timer();
                     0
@@ -422,13 +531,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         SetTimer(hwnd, TIMER_REPLUG, 1500, None);
                     } else if event == DBT_DEVICEREMOVECOMPLETE {
                         if let Some(name) = broadcast_interface_name(lparam) {
-                            if (*app).mouse.as_ref().is_some_and(|m| m.path().eq_ignore_ascii_case(&name)) {
-                                (*app).mouse = None;
-                                (*app).battery = None;
-                                (*app).last_error = Some("mouse unplugged".into());
-                                (*app).update_tray();
-                                (*app).sync_retry_timer();
-                            }
+                            (*app).notify_unplugged(name);
                         }
                     }
                     1
@@ -491,7 +594,7 @@ impl App {
     }
 
     unsafe fn set_icon(&mut self) {
-        let new_icon = make_battery_icon(self.battery, self.mouse.is_some());
+        let new_icon = make_battery_icon(self.battery, self.mouse_connected);
         if new_icon != 0 {
             if self.hicon != 0 {
                 DestroyIcon(self.hicon);
@@ -504,7 +607,7 @@ impl App {
     unsafe fn update_tray(&mut self) {
         self.set_icon();
         let mut tip = format!("Freenapse-DeathAdder V4 Pro ({})", crate::VERSION);
-        match (self.battery, self.mouse.as_ref()) {
+        match (self.battery, self.mouse_connected) {
             (Some(b), _) => {
                 if b.wired {
                     tip.push_str("\n有线直连（无电池）");
@@ -512,8 +615,8 @@ impl App {
                     tip.push_str(&format!("\n电量 {}%{}", b.percent, if b.charging { "（充电中）" } else { "" }));
                 }
             }
-            (None, Some(_)) => tip.push_str("\n鼠标休眠中：移动鼠标唤醒"),
-            (None, None) => tip.push_str("\n未检测到鼠标"),
+            (None, true) => tip.push_str("\n鼠标休眠中：移动鼠标唤醒"),
+            (None, false) => tip.push_str("\n未检测到鼠标"),
         }
         if let Some(st) = &self.stages {
             if let Some(d) = st.stages.get(st.active.saturating_sub(1) as usize) {
@@ -523,11 +626,8 @@ impl App {
         if let Some(p) = self.polling {
             tip.push_str(&format!("\n{p} Hz"));
         }
-        if let Some(g) = self.game.applied.as_deref().and_then(|k| self.config.game_by_key(k)) {
+        if let Some(g) = self.game_applied.as_deref().and_then(|k| self.config.game_by_key(k)) {
             tip.push_str(&format!("\n游戏配置：{}", g.name));
-        }
-        if self.config.tray.onboard_only {
-            tip.push_str("\n纯板载反作弊模式");
         }
         if let Some(e) = &self.config_error {
             tip.push_str(&format!("\n配置文件异常：{e}"));
@@ -556,206 +656,240 @@ impl App {
         self.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     }
 
-    /// Polling rates the menu offers: the open mouse's, else the full HyperPolling list.
-    fn rates(&self) -> &'static [u16] {
-        self.mouse.as_ref().map(|m| m.spec().polling_rates).unwrap_or(&RATES_HYPERPOLLING)
-    }
-
     fn has_game_rules(&self) -> bool {
         !self.config.games.is_empty() || !self.config.polling.games.is_empty()
     }
 
-    /// Reconnect if needed, apply the config once, read battery/DPI/polling.
-    unsafe fn refresh(&mut self) {
-        // The config may have changed since the mouse was opened (the Devices page's switch).
-        if let Some(m) = self.mouse.as_mut() {
-            m.set_write_access(&self.config);
+    fn start_worker(&mut self) {
+        if self.worker.is_some() {
+            return;
         }
-        if self.mouse.is_none() {
-            match Mouse::open() {
-                Ok(m) => {
-                    self.mouse = Some(m);
-                    if config_path() != self.config_file {
+        let hwnd = self.hwnd;
+        let shared = self.shared.clone();
+        if let Ok(h) = std::thread::Builder::new().name("freenapse-tray-io".into()).spawn(move || worker_loop(hwnd, shared)) {
+            self.worker = Some(h);
+        }
+    }
+
+    fn stop_worker(&mut self) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            g.quit = true;
+            g.epoch = g.epoch.wrapping_add(1);
+        }
+        self.shared.cvar.notify_all();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+
+    fn request_refresh(&mut self) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            g.want_refresh = true;
+            g.wake_probe = true;
+        }
+        self.shared.cvar.notify_one();
+    }
+
+    fn wake_worker(&mut self, want_refresh: bool) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            if want_refresh {
+                g.want_refresh = true;
+            }
+            g.wake_probe = true;
+        }
+        self.shared.cvar.notify_one();
+    }
+
+    fn request_reopen(&mut self) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            g.reopen = true;
+            g.want_refresh = true;
+            g.wake_probe = true;
+            g.epoch = g.epoch.wrapping_add(1);
+        }
+        self.shared.cvar.notify_one();
+    }
+
+    fn notify_unplugged(&mut self, name: String) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            g.unplugged = Some(name);
+            g.epoch = g.epoch.wrapping_add(1);
+        }
+        self.shared.cvar.notify_one();
+    }
+
+    fn push_config_to_worker(&mut self, need_base_apply: bool, notify_disk_reload: bool) {
+        {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            g.config = self.config.clone();
+            g.config_ok = self.config_error.is_none();
+            g.need_import = self.need_import;
+            g.need_base_apply = need_base_apply && g.config_ok;
+            g.notify_disk_reload = notify_disk_reload;
+            g.has_game_rules = self.has_game_rules();
+            g.cache_rev = g.cache_rev.wrapping_add(1);
+            g.want_refresh = true;
+            g.wake_probe = true;
+            g.epoch = g.epoch.wrapping_add(1);
+        }
+        self.shared.cvar.notify_one();
+    }
+
+    /// Apply reports produced by the background device worker on the Win32 thread.
+    unsafe fn drain_worker_reports(&mut self) {
+        loop {
+            let Some(rep) = self.shared.reports.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
+                break;
+            };
+            match rep {
+                WorkerReport::Device { connected, model_name, config_file, unplugged_error } => {
+                    self.mouse_connected = connected;
+                    self.mouse_name = model_name;
+                    if connected && config_file != self.config_file {
                         self.switch_config();
                     }
-                }
-                Err(e) => {
-                    self.last_error = Some(e.to_string());
-                    self.battery = None;
-                    self.update_tray();
-                    return;
-                }
-            }
-        }
-        struct Read {
-            applied: Option<usize>,
-            onboard_macros: Option<bool>,
-            battery: Battery,
-            stages: Option<DpiStages>,
-            polling: Option<u16>,
-        }
-        if self.need_import {
-            let imported = apply::import(self.mouse.as_ref().unwrap());
-            match imported {
-                Ok(cfg) => {
-                    if let Err(e) = Config::write_new(&config_path(), &cfg) {
-                        self.config_error = Some(e);
-                    }
-                    self.onboard_macros = self.mouse.as_ref().and_then(|m| m.macro_support().ok()).unwrap_or(false);
-                    load_soft_macros(&cfg, None, self.onboard_macros);
-                    self.config = cfg;
-                    self.need_import = false;
-                    self.note_config_mtime();
-                    self.config_applied = true;
-                    self.game.on_base_applied(self.has_game_rules());
-                    self.sync_poll_timer();
-                    self.sync_fg_hooks();
-                    self.notify("Freenapse-DeathAdder V4 Pro", "已从鼠标板载内存导入初始配置并保存", false);
-                }
-                Err(e) => {
-                    self.last_error = Some(e.to_string());
-                    self.update_tray();
-                    return;
-                }
-            }
-        }
-        // A read-only mouse (unverified, writes not allowed) gets no apply: it would read
-        // everything, be refused at the first write and be retried every few seconds,
-        // keeping the mouse busy while the window waits to talk to it.
-        if !self.mouse.as_ref().unwrap().writes_allowed() {
-            self.config_applied = true;
-        }
-        let need_apply = !self.config_applied && self.config_error.is_none();
-        let base_polling = self.config.polling.rate;
-        let result = {
-            let mouse = self.mouse.as_ref().unwrap();
-            (|| -> Result<Read, crate::hid::HidError> {
-                let applied = if need_apply { Some(apply::apply(mouse, &self.config, base_polling)?.len()) } else { None };
-                let onboard_macros = mouse.macro_support().ok();
-                Ok(Read { applied, onboard_macros, battery: mouse.battery()?, stages: mouse.dpi_stages().ok(), polling: mouse.polling_rate().ok() })
-            })()
-        };
-        match result {
-            Ok(r) => {
-                if let Some(ob) = r.onboard_macros {
-                    self.onboard_macros = ob;
-                }
-                if let Some(n) = r.applied {
-                    self.config_applied = true;
-                    // Base layout was just written: mark game overlay dirty so check_game re-applies any active game.
-                    self.game.on_base_applied(self.has_game_rules());
-                    update_active_soft_macros(&self.config, None, self.onboard_macros);
-                    if n > 0 {
-                        self.notify("Freenapse-DeathAdder V4 Pro", &format!("已将 {n} 项配置同步至鼠标板载内存"), false);
-                    }
-                } else {
-                    update_active_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
-                }
-                self.battery = Some(r.battery);
-                self.stages = r.stages;
-                self.polling = r.polling;
-                self.last_refresh = Some(Instant::now());
-                self.last_error = None;
-                let low = self.config.tray.notify_percent;
-                let b = r.battery;
-                if !b.wired && !b.charging && b.percent <= low && !self.notified_low {
-                    self.notified_low = true;
-                    let name = self.mouse.as_ref().map(|m| ui::display_model(&m.spec().name)).unwrap_or_else(|| "鼠标".into());
-                    self.notify("鼠标电量过低", &format!("{name} 剩余电量 {}%，请及时充电。", b.percent), true);
-                }
-                if b.charging || b.percent > low + 5 {
-                    self.notified_low = false;
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                match e {
-                    // Permanent validation / unsupported errors: stop retrying until the config changes.
-                    crate::hid::HidError::Invalid(_) | crate::hid::HidError::Unsupported(_) | crate::hid::HidError::Unverified(_) => {
-                        self.config_error = Some(msg.clone());
-                    }
-                    // Device unplugged: drop the handle so the next refresh re-enumerates.
-                    crate::hid::HidError::Win32(..) | crate::hid::HidError::NotFound => {
-                        self.mouse = None;
+                    if !connected && unplugged_error {
                         self.battery = None;
+                        self.last_error = Some("mouse unplugged".into());
                     }
-                    // Asleep / transient timeout: keep the last known battery value and retry on wake.
-                    _ => {}
                 }
-                self.last_error = Some(msg);
+                WorkerReport::Imported(res) => match *res {
+                    Ok(cfg) => {
+                        if let Err(e) = Config::write_new(&config_path(), &cfg) {
+                            self.config_error = Some(e);
+                        }
+                        self.config = cfg;
+                        self.need_import = false;
+                        self.note_config_mtime();
+                        self.config_applied = true;
+                        self.game_applied = None;
+                        self.game_dirty = self.has_game_rules();
+                        self.sync_poll_timer();
+                        self.sync_fg_hooks();
+                        self.push_config_to_worker(false, false);
+                        self.check_game();
+                        self.notify("Freenapse-DeathAdder V4 Pro", "已从鼠标板载内存导入初始配置并保存", false);
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                    }
+                },
+                WorkerReport::Refresh { base_applied, from_disk_reload, result } => match result {
+                    Ok((battery, stages, polling)) => {
+                        if let Some(n) = base_applied {
+                            self.config_applied = true;
+                            self.game_applied = None;
+                            if self.has_game_rules() {
+                                self.game_dirty = true;
+                            }
+                            if from_disk_reload {
+                                self.notify("Freenapse-DeathAdder V4 Pro", "检测到配置文件修改：已自动写入鼠标", false);
+                            } else if n > 0 {
+                                self.notify("Freenapse-DeathAdder V4 Pro", &format!("已将 {n} 项配置同步至鼠标板载内存"), false);
+                            }
+                        }
+                        self.battery = Some(battery);
+                        if stages.is_some() {
+                            self.stages = stages;
+                        }
+                        if polling.is_some() {
+                            self.polling = polling;
+                        }
+                        self.last_refresh = Some(Instant::now());
+                        self.last_error = None;
+                        let low = self.config.tray.notify_percent;
+                        if !battery.wired && !battery.charging && battery.percent <= low && !self.notified_low {
+                            self.notified_low = true;
+                            let name = self.mouse_name.as_deref().map(ui::display_model).unwrap_or_else(|| "鼠标".into());
+                            self.notify("鼠标电量过低", &format!("{name} 剩余电量 {}%，请及时充电。", battery.percent), true);
+                        }
+                        if battery.charging || battery.percent > low + 5 {
+                            self.notified_low = false;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        match e {
+                            HidError::Invalid(_) | HidError::Unsupported(_) | HidError::Unverified(_) => {
+                                self.config_error = Some(msg.clone());
+                            }
+                            HidError::Win32(..) | HidError::NotFound => {
+                                self.mouse_connected = false;
+                                self.battery = None;
+                            }
+                            _ => {}
+                        }
+                        self.last_error = Some(msg);
+                    }
+                },
+                WorkerReport::Game { epoch, applied, dirty, deferred, polling, stages, error } => {
+                    let latest_epoch = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner()).epoch;
+                    self.game_applied = applied;
+                    self.game_dirty = dirty || epoch != latest_epoch;
+                    self.game_deferred = deferred && epoch == latest_epoch;
+                    if polling.is_some() {
+                        self.polling = polling;
+                    }
+                    if stages.is_some() {
+                        self.stages = stages;
+                    }
+                    self.last_error = error;
+                }
             }
         }
         self.update_tray();
+        self.sync_retry_timer();
     }
 
-    /// Per-game profiles: when a configured game owns the foreground window,
-    /// write its polling rate, DPI stage and button layout; restore the base
-    /// config when it goes away.
+    /// Per-game profiles: identify the foreground executable on the UI thread (non-blocking)
+    /// and hand the target generation to the device worker.
     unsafe fn check_game(&mut self) {
-        if !self.has_game_rules() && !self.game.dirty && self.game.applied.is_none() {
-            update_active_soft_macros(&self.config, None, self.onboard_macros);
+        if !self.has_game_rules() && !self.game_dirty && self.game_applied.is_none() {
+            self.wanted_game = None;
             return;
         }
         let path = match query_foreground() {
-            FgQuery::TransientEmpty if self.game.fg_empty_retries < 3 => {
-                self.game.fg_empty_retries += 1;
+            FgQuery::TransientEmpty if self.fg_empty_retries < 3 => {
+                self.fg_empty_retries += 1;
                 SetTimer(self.hwnd, TIMER_GAME, 150, None);
                 return;
             }
             FgQuery::TransientEmpty => {
-                self.game.fg_empty_retries = 0;
+                self.fg_empty_retries = 0;
                 String::new()
             }
             FgQuery::Window(opt) => {
-                self.game.fg_empty_retries = 0;
+                self.fg_empty_retries = 0;
                 opt.unwrap_or_default()
             }
         };
         let wanted = self.config.game_for(&path).map(|g| g.key);
-        // Isolate & cancel disallowed software macros immediately, without waiting for HID writes.
-        update_active_soft_macros(&self.config, wanted.as_deref(), self.onboard_macros);
+        self.wanted_game = wanted.clone();
 
-        if !self.game.needs_sync(&wanted) {
-            return;
-        }
-        self.game.begin_sync();
-        if !user_active() && !self.retry_ticks.is_multiple_of(4) {
-            return;
-        }
-        let Some(mouse) = self.mouse.as_ref() else {
-            return;
+        let need_notify = {
+            let mut g = self.shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            if g.wanted_game != wanted {
+                g.wanted_game = wanted.clone();
+                g.wake_probe = true;
+                g.epoch = g.epoch.wrapping_add(1);
+                self.game_dirty = true;
+                self.game_deferred = false;
+                true
+            } else if self.game_dirty || wanted != self.game_applied {
+                self.game_dirty = true;
+                g.wake_probe = true;
+                true
+            } else {
+                false
+            }
         };
-        if !mouse.writes_allowed() {
-            self.game.commit_sync(wanted);
-            return;
-        }
-        let over = wanted.as_deref().and_then(|g| self.config.game_by_key(g));
-        let polling = over.as_ref().map(|g| g.polling).unwrap_or(self.config.polling.rate);
-        let cfg = &self.config;
-        let game = &mut self.game;
-        let result: Result<(), crate::hid::HidError> = (|| {
-            if mouse.polling_rate()? != polling {
-                mouse.set_polling_rate(polling)?;
-            }
-            let st = mouse.dpi_stages()?;
-            let stage = game.plan_dpi_stage(over.as_ref().and_then(|g| g.dpi_stage), over.is_some(), st.active);
-            if let Some(stage) = stage.filter(|s| *s != st.active && (1..=st.stages.len() as u8).contains(s)) {
-                mouse.set_dpi_stages(stage, &st.stages)?;
-            }
-            apply::apply_game_buttons(mouse, cfg, over.as_ref())?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.game.commit_sync(wanted);
-                self.polling = mouse.polling_rate().ok();
-                self.stages = mouse.dpi_stages().ok();
-                self.last_error = None;
-                self.update_tray();
-            }
-            Err(e) => {
-                self.last_error = Some(e.to_string());
-            }
+        if need_notify {
+            self.shared.cvar.notify_one();
         }
     }
 
@@ -795,12 +929,14 @@ impl App {
         }
     }
 
-    /// Arm the wake-up retry timer with bounded backoff (`1200..=4800 ms`) only while transient work is pending.
+    /// Arm the wake-up retry timer with bounded backoff (`1200..=4800 ms`, or `200 ms` while a held shortcut defers writes).
     unsafe fn sync_retry_timer(&mut self) {
         let need_base = self.need_import || (!self.config_applied && self.config_error.is_none()) || self.battery.is_none();
-        let need = (need_base || self.game.dirty) && self.config_error.is_none();
+        let need = (need_base || self.game_dirty) && self.config_error.is_none();
         if need {
-            let next_ms = if self.retry_ms == 0 {
+            let next_ms = if self.game_deferred {
+                RETRY_DEFER_MS
+            } else if self.retry_ms == 0 || self.retry_ms == RETRY_DEFER_MS {
                 RETRY_BASE_MS
             } else if self.last_error.is_some() {
                 (self.retry_ms * 2).min(RETRY_MAX_MS)
@@ -831,12 +967,15 @@ impl App {
         };
         self.config = config;
         self.config_error = err;
-        load_soft_macros(&self.config, None, self.onboard_macros);
         self.sync_poll_timer();
         self.sync_fg_hooks();
         self.config_applied = false;
-        self.game = GameSync::default();
+        self.game_applied = None;
+        self.game_dirty = self.has_game_rules();
+        self.game_deferred = false;
         self.note_config_mtime();
+        self.push_config_to_worker(!self.need_import, false);
+        self.check_game();
     }
 
     fn note_config_mtime(&mut self) {
@@ -866,17 +1005,14 @@ impl App {
                 return;
             }
         }
-        load_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
         self.sync_poll_timer();
         self.sync_fg_hooks();
         self.config_applied = false;
-        self.game.on_base_applied(self.has_game_rules());
-        self.refresh();
+        self.game_applied = None;
+        self.game_dirty = self.has_game_rules();
+        self.push_config_to_worker(true, true);
         self.check_game();
         self.sync_retry_timer();
-        if self.config_applied {
-            self.notify("Freenapse-DeathAdder V4 Pro", "检测到配置文件修改：已自动写入鼠标", false);
-        }
     }
 
     /// The update thread found a release newer than this build.
@@ -895,45 +1031,36 @@ impl App {
 
     unsafe fn show_menu(&mut self) {
         let menu = CreatePopupMenu();
-        let status = match (self.battery, self.mouse.as_ref()) {
-            (Some(b), _) if b.wired => "有线供电（无内置电池）".to_string(),
-            (Some(b), _) => format!("当前电量 {}%{}", b.percent, if b.charging { "（充电中）" } else { "" }),
-            (None, Some(_)) => "鼠标已休眠（移动唤醒）".to_string(),
-            (None, None) => "未检测到鼠标".to_string(),
-        };
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(&status).as_ptr());
-        if let Some(e) = &self.last_error {
-            if self.battery.is_none() {
-                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(e).as_ptr());
+        let mut parts = Vec::new();
+        match (self.battery, self.mouse_connected) {
+            (Some(b), _) if b.wired => parts.push("有线直连".to_string()),
+            (Some(b), _) => parts.push(format!("电量 {}%{}", b.percent, if b.charging { "（充电中）" } else { "" })),
+            (None, true) => parts.push("鼠标已休眠（移动唤醒）".to_string()),
+            (None, false) => parts.push("未检测到鼠标".to_string()),
+        }
+        if self.battery.is_some() {
+            if let Some(d) = self.stages.as_ref().and_then(|st| st.stages.get(st.active.saturating_sub(1) as usize)) {
+                parts.push(format!("{} DPI", d.0));
+            }
+            if let Some(p) = self.polling {
+                parts.push(format!("{p} Hz"));
+            }
+            if let Some(g) = self.game_applied.as_deref().and_then(|k| self.config.game_by_key(k)) {
+                parts.push(g.name);
             }
         }
+        let status = parts.join(" · ");
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(&status).as_ptr());
         if let Some(v) = &self.update_tag {
-            AppendMenuW(menu, MF_STRING, ID_UPDATE, wide(&format!("查看上游版本 {v}...")).as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_UPDATE, wide(&format!("发现新版本 {v}...")).as_ptr());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-
-        let stages = self.stages.clone().map(|s| s.stages).unwrap_or_else(|| self.config.stage_pairs());
-        let active = self.stages.as_ref().map(|s| s.active).unwrap_or(self.config.dpi.active);
-        for (i, (x, _)) in stages.iter().enumerate() {
-            let checked = if i + 1 == active as usize { MF_CHECKED } else { 0 };
-            AppendMenuW(menu, MF_STRING | checked, ID_STAGE_BASE + i, wide(&format!("DPI 档位 {}：{x}", i + 1)).as_ptr());
-        }
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        for (i, hz) in self.rates().iter().enumerate() {
-            let checked = if Some(*hz) == self.polling { MF_CHECKED } else { 0 };
-            AppendMenuW(menu, MF_STRING | checked, ID_POLL_BASE + i, wide(&format!("回报率 {hz} Hz")).as_ptr());
-        }
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("打开控制中心...").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("打开控制中心").as_ptr());
+        SetMenuDefaultItem(menu, ID_SETTINGS as u32, 0);
         let auto_chk = if crate::autostart::is_enabled() { MF_CHECKED } else { 0 };
-        AppendMenuW(menu, MF_STRING | auto_chk, ID_AUTOSTART, wide("开机静默自启").as_ptr());
-        let ob_chk = if self.config.tray.onboard_only { MF_CHECKED } else { 0 };
-        AppendMenuW(menu, MF_STRING | ob_chk, ID_ONBOARD_ONLY, wide("纯板载反作弊模式").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("立即刷新状态").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_APPLY, wide("重新写入配置").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, wide("打开配置文件").as_ptr());
+        AppendMenuW(menu, MF_STRING | auto_chk, ID_AUTOSTART, wide("开机自启").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_QUIT, wide("退出托盘").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_QUIT, wide("退出").as_ptr());
 
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
@@ -946,89 +1073,597 @@ impl App {
 
     unsafe fn handle_command(&mut self, id: usize) {
         match id {
-            0 => {}
-            ID_QUIT => {
-                DestroyWindow(self.hwnd);
-            }
-            ID_REFRESH => self.refresh(),
-            ID_SETTINGS => {
-                ui::open(self.hwnd);
-            }
+            ID_SETTINGS => ui::open(self.hwnd),
             ID_AUTOSTART => {
                 let want = !crate::autostart::is_enabled();
                 if let Err(e) = crate::autostart::set(want) {
                     self.notify("Freenapse-DeathAdder V4 Pro", &format!("设置开机自启失败：{e}"), true);
                 }
             }
-            ID_ONBOARD_ONLY => {
-                self.config.tray.onboard_only = !self.config.tray.onboard_only;
-                if let Err(e) = Config::write_new(&config_path(), &self.config) {
-                    self.notify("Freenapse-DeathAdder V4 Pro", &format!("保存配置失败：{e}"), true);
-                }
-                self.note_config_mtime();
-                update_active_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
-                if !self.config.soft_macro_slots().is_empty() {
-                    self.config_applied = false;
-                    self.game.on_base_applied(self.has_game_rules());
-                    self.refresh();
-                    self.check_game();
-                    self.sync_retry_timer();
-                } else {
-                    self.update_tray();
-                }
-            }
             ID_UPDATE => {
                 ShellExecuteW(0, wide("open").as_ptr(), wide(crate::update::RELEASES_URL).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
             }
-            ID_APPLY => {
-                match Config::load_or_create(&config_path()) {
-                    Ok(c) => {
-                        self.config = c;
-                        self.config_error = None;
-                    }
-                    Err(e) => self.config_error = Some(e),
-                }
-                load_soft_macros(&self.config, self.game.applied.as_deref(), self.onboard_macros);
-                self.sync_poll_timer();
-                self.sync_fg_hooks();
-                self.note_config_mtime();
-                self.config_applied = false;
-                self.game.on_base_applied(self.has_game_rules());
-                self.refresh();
-                self.check_game();
-                self.sync_retry_timer();
-            }
-            ID_OPEN_CONFIG => {
-                let path = config_path();
-                let _ = Config::load_or_create(&path);
-                ShellExecuteW(0, wide("open").as_ptr(), wide(&path.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
-            }
-            id if (ID_STAGE_BASE..ID_STAGE_BASE + 5).contains(&id) => {
-                let idx = id - ID_STAGE_BASE;
-                if let (Some(mouse), Some(st)) = (self.mouse.as_ref(), self.stages.as_ref()) {
-                    if idx < st.stages.len() {
-                        let r = mouse.set_dpi_stages((idx + 1) as u8, &st.stages);
-                        if let Err(e) = r {
-                            self.last_error = Some(e.to_string());
-                        }
-                        self.stages = mouse.dpi_stages().ok();
-                        self.update_tray();
-                    }
-                }
-            }
-            id if (ID_POLL_BASE..ID_POLL_BASE + self.rates().len()).contains(&id) => {
-                let hz = self.rates()[id - ID_POLL_BASE];
-                if let Some(mouse) = self.mouse.as_ref() {
-                    match mouse.set_polling_rate(hz) {
-                        Ok(()) => {
-                            self.polling = Some(hz);
-                        }
-                        Err(e) => self.last_error = Some(e.to_string()),
-                    }
-                    self.update_tray();
-                }
+            ID_QUIT => {
+                DestroyWindow(self.hwnd);
             }
             _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background device worker: coalesced latest-target switching, field-level
+// differential writes, and Win/shortcut release fence.
+// ---------------------------------------------------------------------------
+
+trait SyncBackend {
+    fn spec(&self) -> &DeviceSpec;
+    fn profile(&self) -> u8;
+    fn writes_allowed(&self) -> bool;
+    fn polling_rate(&self) -> crate::hid::Result<u16>;
+    fn set_polling_rate(&self, hz: u16) -> crate::hid::Result<()>;
+    fn dpi_stages(&self) -> crate::hid::Result<DpiStages>;
+    fn set_dpi_stages(&self, active: u8, stages: &[(u16, u16)]) -> crate::hid::Result<()>;
+    fn current_button(&self, code: u8, name: &str, bound: bool) -> crate::hid::Result<Option<ButtonFunction>>;
+    fn set_button(&self, profile: u8, code: u8, f: ButtonFunction) -> crate::hid::Result<()>;
+}
+
+impl SyncBackend for Mouse {
+    fn spec(&self) -> &DeviceSpec {
+        Mouse::spec(self)
+    }
+    fn profile(&self) -> u8 {
+        Mouse::profile(self)
+    }
+    fn writes_allowed(&self) -> bool {
+        Mouse::writes_allowed(self)
+    }
+    fn polling_rate(&self) -> crate::hid::Result<u16> {
+        Mouse::polling_rate(self)
+    }
+    fn set_polling_rate(&self, hz: u16) -> crate::hid::Result<()> {
+        Mouse::set_polling_rate(self, hz)
+    }
+    fn dpi_stages(&self) -> crate::hid::Result<DpiStages> {
+        Mouse::dpi_stages(self)
+    }
+    fn set_dpi_stages(&self, active: u8, stages: &[(u16, u16)]) -> crate::hid::Result<()> {
+        Mouse::set_dpi_stages(self, active, stages)
+    }
+    fn current_button(&self, code: u8, name: &str, bound: bool) -> crate::hid::Result<Option<ButtonFunction>> {
+        apply::current_button(self, code, name, false, bound)
+    }
+    fn set_button(&self, profile: u8, code: u8, f: ButtonFunction) -> crate::hid::Result<()> {
+        Mouse::set_button(self, profile, code, false, f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceOutcome {
+    Ready,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncStep {
+    Committed,
+    Cancelled,
+    Deferred,
+}
+
+fn any_vk_pressed_os(vks: &[u16]) -> bool {
+    unsafe { vks.iter().any(|&vk| (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0) }
+}
+
+fn push_vk_unique(out: &mut Vec<u16>, vk: u16) {
+    if !out.contains(&vk) {
+        out.push(vk);
+    }
+}
+
+/// Wait until no virtual key in `vks` is held down and `vks` stays quiet for the required window:
+/// - If any guarded key is down initially (or goes down during an initial Win-shortcut settle check),
+///   require `quiet_held_ms` of continuous release before proceeding.
+/// - Otherwise, if `initial_quiet_ms > 0` (e.g. a button involving `VK_LWIN` / `VK_RWIN` is changing),
+///   verify `initial_quiet_ms` of quietness so a just-released `Win+D` finishes settling on the dongle.
+fn wait_until_quiet(
+    vks: &[u16],
+    initial_quiet_ms: u64,
+    quiet_held_ms: u64,
+    max_wait_ms: u64,
+    mut any_down: impl FnMut(&[u16]) -> bool,
+    mut is_cancelled: impl FnMut() -> bool,
+    mut sleep_step: impl FnMut(u64),
+) -> FenceOutcome {
+    if vks.is_empty() {
+        return FenceOutcome::Ready;
+    }
+    let mut saw_down = any_down(vks);
+    if !saw_down && initial_quiet_ms == 0 {
+        return FenceOutcome::Ready;
+    }
+    let mut quiet_for = 0u64;
+    let mut waited = 0u64;
+    loop {
+        if is_cancelled() {
+            return FenceOutcome::Cancelled;
+        }
+        let target_quiet = if saw_down { quiet_held_ms } else { initial_quiet_ms };
+        if !any_down(vks) && quiet_for >= target_quiet {
+            return FenceOutcome::Ready;
+        }
+        if waited >= max_wait_ms {
+            return FenceOutcome::TimedOut;
+        }
+        sleep_step(FENCE_STEP_MS);
+        waited += FENCE_STEP_MS;
+        if is_cancelled() {
+            return FenceOutcome::Cancelled;
+        }
+        if any_down(vks) {
+            saw_down = true;
+            quiet_for = 0;
+        } else {
+            quiet_for += FENCE_STEP_MS;
+        }
+    }
+}
+
+/// Collect virtual keys guarded during a profile transition (`VK_LWIN`, `VK_RWIN`, side buttons,
+/// and all virtual keys emitted by changing or unknown normal-layer button mappings), returning `(vks, involves_win_binding)`.
+fn build_switch_guard_vks(spec: &DeviceSpec, cfg: &Config, game: &GameSync, hw: &HwCache, wanted: Option<&str>) -> (Vec<u16>, bool) {
+    let over = wanted.and_then(|k| cfg.game_by_key(k));
+    let prev_over = game.applied.as_deref().and_then(|k| cfg.game_by_key(k));
+    let mut binding_vks = Vec::new();
+    for b in spec.buttons {
+        let (want_func, _) = apply::normal_button_target(cfg, over.as_ref(), b);
+        match hw.buttons.get(&b.code).copied() {
+            Some(Some(cur)) if cur == want_func => continue,
+            Some(None) => continue,
+            Some(Some(cur)) => {
+                cur.push_virtual_keys(&mut binding_vks);
+                want_func.push_virtual_keys(&mut binding_vks);
+            }
+            None => {
+                let (base_f, _) = apply::normal_button_target(cfg, None, b);
+                base_f.push_virtual_keys(&mut binding_vks);
+                if let Some(po) = prev_over.as_ref() {
+                    let (pf, _) = apply::normal_button_target(cfg, Some(po), b);
+                    pf.push_virtual_keys(&mut binding_vks);
+                }
+                want_func.push_virtual_keys(&mut binding_vks);
+            }
+        }
+    }
+    let involves_win = binding_vks.contains(&0x5b) || binding_vks.contains(&0x5c);
+    let mut out = vec![0x5b, 0x5c, 0x05, 0x06]; // VK_LWIN, VK_RWIN, VK_XBUTTON1, VK_XBUTTON2
+    for vk in binding_vks {
+        push_vk_unique(&mut out, vk);
+    }
+    (out, involves_win)
+}
+
+/// Execute one incremental game-profile sync toward `wanted`, checking `is_cancelled` before every HID call
+/// and guarding active shortcut/button gestures so held keys (like `Win+D`) are never torn mid-press.
+#[allow(clippy::too_many_arguments)]
+fn sync_game_target(
+    mouse: &impl SyncBackend,
+    cfg: &Config,
+    wanted: &Option<String>,
+    game: &mut GameSync,
+    hw: &mut HwCache,
+    mut any_down: impl FnMut(&[u16]) -> bool,
+    mut is_cancelled: impl FnMut() -> bool,
+    mut sleep_step: impl FnMut(u64),
+) -> Result<SyncStep, HidError> {
+    if !game.needs_sync(wanted) {
+        return Ok(SyncStep::Committed);
+    }
+    game.begin_sync();
+    if !mouse.writes_allowed() {
+        game.commit_sync(wanted.clone());
+        return Ok(SyncStep::Committed);
+    }
+    if is_cancelled() {
+        return Ok(SyncStep::Cancelled);
+    }
+
+    let over = wanted.as_deref().and_then(|k| cfg.game_by_key(k));
+    let want_polling = over.as_ref().map(|g| g.polling).unwrap_or(cfg.polling.rate);
+    let game_stage = over.as_ref().and_then(|g| g.dpi_stage);
+
+    // Pre-switch gesture fence: do not touch polling rate, DPI or button mappings while Win / side buttons
+    // or any changing button's virtual key is held down or settling.
+    let (guard_vks, involves_win) = build_switch_guard_vks(mouse.spec(), cfg, game, hw, wanted.as_deref());
+    let init_quiet = if involves_win { FENCE_QUIET_WIN_MS } else { 0 };
+    match wait_until_quiet(&guard_vks, init_quiet, FENCE_QUIET_HELD_MS, FENCE_MAX_WAIT_MS, &mut any_down, &mut is_cancelled, &mut sleep_step) {
+        FenceOutcome::Ready => {}
+        FenceOutcome::Cancelled => return Ok(SyncStep::Cancelled),
+        FenceOutcome::TimedOut => return Ok(SyncStep::Deferred),
+    }
+
+    // 1. Polling rate (skip GET + SET when already known equal).
+    if hw.polling != Some(want_polling) {
+        if is_cancelled() {
+            return Ok(SyncStep::Cancelled);
+        }
+        let cur = match hw.polling {
+            Some(p) => p,
+            None => {
+                let p = mouse.polling_rate()?;
+                hw.polling = Some(p);
+                p
+            }
+        };
+        if cur != want_polling {
+            if is_cancelled() {
+                return Ok(SyncStep::Cancelled);
+            }
+            hw.polling = None;
+            mouse.set_polling_rate(want_polling)?;
+            hw.polling = Some(want_polling);
+        }
+    }
+
+    // 2. DPI stage: read live stages once before the first game DPI override so a stage picked with the
+    // physical DPI button on desktop is preserved in `stage_before_game`; leaving a game needs zero GETs.
+    if is_cancelled() {
+        return Ok(SyncStep::Cancelled);
+    }
+    let need_live_stage_read = hw.stages.is_none() || (game.stage_before_game.is_none() && game_stage.is_some());
+    let st = if need_live_stage_read {
+        let s = mouse.dpi_stages()?;
+        hw.stages = Some(s.clone());
+        s
+    } else {
+        hw.stages.clone().unwrap()
+    };
+    let target_stage = game.plan_dpi_stage(game_stage, over.is_some(), st.active);
+    if let Some(stage) = target_stage.filter(|s| *s != st.active && (1..=st.stages.len() as u8).contains(s)) {
+        if is_cancelled() {
+            return Ok(SyncStep::Cancelled);
+        }
+        hw.stages = None;
+        mouse.set_dpi_stages(stage, &st.stages)?;
+        hw.stages = Some(DpiStages { active: stage, stages: st.stages });
+    }
+
+    // 3. Normal-layer buttons: skip every button whose cached assignment already equals `want_func`,
+    // and re-verify the release fence right before each `set_button` write.
+    let profile = mouse.profile();
+    for b in mouse.spec().buttons {
+        if is_cancelled() {
+            return Ok(SyncStep::Cancelled);
+        }
+        let (want_func, bound) = apply::normal_button_target(cfg, over.as_ref(), b);
+        let cur_func = match hw.buttons.get(&b.code).copied() {
+            Some(Some(f)) => f,
+            Some(None) => continue,
+            None => match mouse.current_button(b.code, b.name, bound)? {
+                Some(f) => {
+                    hw.buttons.insert(b.code, Some(f));
+                    f
+                }
+                None => {
+                    hw.buttons.insert(b.code, None);
+                    continue;
+                }
+            },
+        };
+        if cur_func == want_func {
+            continue;
+        }
+        let mut btn_vks = vec![0x5b, 0x5c, 0x05, 0x06];
+        cur_func.push_virtual_keys(&mut btn_vks);
+        want_func.push_virtual_keys(&mut btn_vks);
+        match wait_until_quiet(&btn_vks, 0, FENCE_QUIET_HELD_MS, FENCE_MAX_WAIT_MS, &mut any_down, &mut is_cancelled, &mut sleep_step) {
+            FenceOutcome::Ready => {}
+            FenceOutcome::Cancelled => return Ok(SyncStep::Cancelled),
+            FenceOutcome::TimedOut => return Ok(SyncStep::Deferred),
+        }
+        if is_cancelled() {
+            return Ok(SyncStep::Cancelled);
+        }
+        hw.buttons.remove(&b.code);
+        mouse.set_button(profile, b.code, want_func)?;
+        hw.buttons.insert(b.code, Some(want_func));
+    }
+
+    if is_cancelled() {
+        return Ok(SyncStep::Cancelled);
+    }
+    game.commit_sync(wanted.clone());
+    Ok(SyncStep::Committed)
+}
+
+fn worker_loop(hwnd: HWND, shared: Arc<WorkerShared>) {
+    let mut mouse: Option<Mouse> = None;
+    let mut hw = HwCache::default();
+    let mut game = GameSync::default();
+    let mut seen_cache_rev = 0u64;
+    let mut backoff = false;
+
+    loop {
+        struct Work {
+            epoch: u64,
+            reopen: bool,
+            unplugged: Option<String>,
+            cache_stale: bool,
+            config: Config,
+            config_ok: bool,
+            need_import: bool,
+            need_apply: bool,
+            from_disk_reload: bool,
+            wanted_game: Option<String>,
+            has_game_rules: bool,
+            want_refresh: bool,
+        }
+
+        let work = {
+            let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if g.quit {
+                    return;
+                }
+                if g.wake_probe {
+                    backoff = false;
+                }
+                let cache_stale = g.cache_rev != seen_cache_rev;
+                let has_dev = g.reopen || g.unplugged.is_some();
+                let need_import = g.need_import;
+                let need_apply = g.need_base_apply && g.config_ok;
+                let need_game = game.needs_sync(&g.wanted_game) && g.config_ok;
+                let has_work = has_dev || cache_stale || g.want_refresh || (!backoff && (need_import || need_apply || need_game));
+                if has_work {
+                    break;
+                }
+                g = shared.cvar.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            let cache_stale = g.cache_rev != seen_cache_rev;
+            seen_cache_rev = g.cache_rev;
+            g.wake_probe = false;
+            Work {
+                epoch: g.epoch,
+                reopen: mem::replace(&mut g.reopen, false),
+                unplugged: g.unplugged.take(),
+                cache_stale,
+                config: g.config.clone(),
+                config_ok: g.config_ok,
+                need_import: g.need_import,
+                need_apply: g.need_base_apply && g.config_ok,
+                from_disk_reload: mem::replace(&mut g.notify_disk_reload, false),
+                wanted_game: g.wanted_game.clone(),
+                has_game_rules: g.has_game_rules,
+                want_refresh: mem::replace(&mut g.want_refresh, false),
+            }
+        };
+
+        if let Some(path) = work.unplugged {
+            if mouse.as_ref().is_some_and(|m| m.path().eq_ignore_ascii_case(&path)) {
+                mouse = None;
+                hw.clear();
+                shared.push_report(hwnd, WorkerReport::Device { connected: false, model_name: None, config_file: config_path(), unplugged_error: true });
+            }
+        }
+        if work.reopen {
+            mouse = None;
+            hw.clear();
+        }
+        if work.cache_stale {
+            hw.clear();
+            if work.has_game_rules || game.applied.is_some() {
+                game.begin_sync();
+            }
+        }
+
+        if let Some(m) = mouse.as_mut() {
+            m.set_write_access(&work.config);
+        }
+        if mouse.is_none() {
+            match Mouse::open() {
+                Ok(mut m) => {
+                    m.set_write_access(&work.config);
+                    let model_name = Some(m.spec().name.to_string());
+                    let cfg_file = config_path();
+                    hw.clear();
+                    game = GameSync::default();
+                    if work.has_game_rules {
+                        game.begin_sync();
+                    }
+                    mouse = Some(m);
+                    shared.push_report(hwnd, WorkerReport::Device { connected: true, model_name, config_file: cfg_file, unplugged_error: false });
+                }
+                Err(e) => {
+                    backoff = true;
+                    shared.push_report(hwnd, WorkerReport::Refresh { base_applied: None, from_disk_reload: false, result: Err(e) });
+                    continue;
+                }
+            }
+        }
+
+        let m = mouse.as_ref().unwrap();
+
+        // 1. Initial import when no config file existed yet.
+        if work.need_import {
+            match apply::import(m) {
+                Ok(cfg) => {
+                    let stages = m.dpi_stages().ok();
+                    hw.seed_from_base(m.spec(), &cfg, cfg.polling.rate, stages);
+                    game.on_base_applied(!cfg.games.is_empty() || !cfg.polling.games.is_empty());
+                    {
+                        let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+                        g.need_import = false;
+                    }
+                    backoff = false;
+                    shared.push_report(hwnd, WorkerReport::Imported(Box::new(Ok(cfg))));
+                }
+                Err(e) => {
+                    backoff = true;
+                    if matches!(e, HidError::Win32(..) | HidError::NotFound) {
+                        mouse = None;
+                        hw.clear();
+                    }
+                    shared.push_report(hwnd, WorkerReport::Imported(Box::new(Err(e.to_string()))));
+                }
+            }
+            continue;
+        }
+
+        // 2. Startup / disk-reload base `apply()`.
+        let mut did_base_refresh = false;
+        if work.need_apply {
+            let writes_ok = m.writes_allowed();
+            if !writes_ok {
+                let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+                g.need_base_apply = false;
+            } else {
+                let base_polling = work.config.polling.rate;
+                match apply::apply(m, &work.config, base_polling) {
+                    Ok(changes) => {
+                        let stages = m.dpi_stages().ok();
+                        hw.seed_from_base(m.spec(), &work.config, base_polling, stages.clone());
+                        game.on_base_applied(work.has_game_rules);
+                        {
+                            let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+                            g.need_base_apply = false;
+                        }
+                        backoff = false;
+                        if let Ok(bat) = m.battery() {
+                            did_base_refresh = true;
+                            shared.push_report(
+                                hwnd,
+                                WorkerReport::Refresh {
+                                    base_applied: Some(changes.len()),
+                                    from_disk_reload: work.from_disk_reload,
+                                    result: Ok((bat, stages, Some(base_polling))),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        backoff = true;
+                        hw.clear();
+                        if matches!(e, HidError::Invalid(_) | HidError::Unsupported(_) | HidError::Unverified(_)) {
+                            let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+                            g.config_ok = false;
+                        }
+                        let gone = matches!(e, HidError::Win32(..) | HidError::NotFound);
+                        shared.push_report(hwnd, WorkerReport::Refresh { base_applied: None, from_disk_reload: false, result: Err(e) });
+                        if gone {
+                            mouse = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Per-game profile sync (top priority over periodic battery refresh; cancellable on newer `epoch`).
+        if let Some(m) = mouse.as_ref()
+            && work.config_ok
+            && game.needs_sync(&work.wanted_game)
+        {
+            let my_epoch = work.epoch;
+            let is_cancelled = || shared.goal.lock().unwrap_or_else(|e| e.into_inner()).epoch != my_epoch;
+            let sleep_step = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+            match sync_game_target(m, &work.config, &work.wanted_game, &mut game, &mut hw, any_vk_pressed_os, is_cancelled, sleep_step) {
+                Ok(SyncStep::Committed) => {
+                    backoff = false;
+                    shared.push_report(
+                        hwnd,
+                        WorkerReport::Game {
+                            epoch: my_epoch,
+                            applied: game.applied.clone(),
+                            dirty: false,
+                            deferred: false,
+                            polling: hw.polling,
+                            stages: hw.stages.clone(),
+                            error: None,
+                        },
+                    );
+                }
+                Ok(SyncStep::Cancelled) => {
+                    // Newer foreground target or config already arrived: loop immediately without backoff.
+                    backoff = false;
+                    continue;
+                }
+                Ok(SyncStep::Deferred) => {
+                    // Guarded shortcut/button stayed held past max_wait: keep current hardware binding untouched and retry shortly.
+                    backoff = true;
+                    shared.push_report(
+                        hwnd,
+                        WorkerReport::Game {
+                            epoch: my_epoch,
+                            applied: game.applied.clone(),
+                            dirty: true,
+                            deferred: true,
+                            polling: hw.polling,
+                            stages: hw.stages.clone(),
+                            error: None,
+                        },
+                    );
+                }
+                Err(e) => {
+                    backoff = true;
+                    if matches!(e, HidError::Invalid(_) | HidError::Unsupported(_) | HidError::Unverified(_)) {
+                        let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
+                        g.config_ok = false;
+                    }
+                    let msg = e.to_string();
+                    let gone = matches!(e, HidError::Win32(..) | HidError::NotFound);
+                    if gone {
+                        mouse = None;
+                        hw.clear();
+                    }
+                    shared.push_report(
+                        hwnd,
+                        WorkerReport::Game {
+                            epoch: my_epoch,
+                            applied: game.applied.clone(),
+                            dirty: true,
+                            deferred: false,
+                            polling: hw.polling,
+                            stages: hw.stages.clone(),
+                            error: Some(msg),
+                        },
+                    );
+                    if gone {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 4. Periodic battery / live status refresh (skipped if already refreshed above or superseded by a newer epoch).
+        let Some(m) = mouse.as_ref() else { continue };
+        if work.want_refresh && !did_base_refresh && shared.goal.lock().unwrap_or_else(|e| e.into_inner()).epoch == work.epoch {
+            match m.battery() {
+                Ok(bat) => {
+                    backoff = false;
+                    let stages = m.dpi_stages().ok().or_else(|| hw.stages.clone());
+                    if stages.is_some() {
+                        hw.stages = stages.clone();
+                    }
+                    let polling = match hw.polling {
+                        Some(p) => Some(p),
+                        None => m.polling_rate().ok(),
+                    };
+                    if polling.is_some() {
+                        hw.polling = polling;
+                    }
+                    shared.push_report(hwnd, WorkerReport::Refresh { base_applied: None, from_disk_reload: false, result: Ok((bat, stages, polling)) });
+                }
+                Err(e) => {
+                    backoff = true;
+                    let gone = matches!(e, HidError::Win32(..) | HidError::NotFound);
+                    shared.push_report(hwnd, WorkerReport::Refresh { base_applied: None, from_disk_reload: false, result: Err(e) });
+                    if gone {
+                        mouse = None;
+                        hw.clear();
+                    }
+                }
+            }
         }
     }
 }
@@ -1040,8 +1675,8 @@ unsafe extern "system" fn win_event_proc(_hook: HWINEVENTHOOK, _event: u32, _hwn
     }
     let tray = TRAY_HWND.load(Ordering::Relaxed);
     if tray != 0 {
-        // 120 ms one-shot debounce: switches almost instantly while coalescing rapid Alt+Tab hops.
-        SetTimer(tray, TIMER_GAME, 120, None);
+        // 80 ms one-shot debounce: switches swiftly while coalescing rapid Alt+Tab hops.
+        SetTimer(tray, TIMER_GAME, 80, None);
     }
 }
 
@@ -1153,248 +1788,6 @@ fn check_updates(hwnd: HWND) {
         let lparam = newer.map(|t| Box::into_raw(Box::new(t)) as LPARAM).unwrap_or(0);
         unsafe { PostMessageW(hwnd, WM_UPDATE_RESULT, 0, lparam) };
     });
-}
-
-// ---------------------------------------------------------------------------
-// Software macros. For a mouse without macro memory (`Mouse::macro_support`)
-// the macro is played from the PC, like Synapse does: the bound button sends F13..F24, a low-level
-// keyboard hook swallows that key and plays the macro's events.
-// ---------------------------------------------------------------------------
-
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-use crate::macros::{Event, Playback};
-use crate::player;
-
-struct SoftSlot {
-    events: Arc<Vec<Event>>,
-    play: Playback,
-    /// Flag of the playback loop in progress ("while held" / toggle / times / sequence); set to stop it.
-    stop: Mutex<Arc<AtomicBool>>,
-    /// Serializes runs on this slot so a cancelled run releases held keys/buttons before a new one starts.
-    run_lock: Mutex<()>,
-    running: AtomicBool,
-    down: AtomicBool,
-    seq: AtomicUsize,
-}
-
-static SOFT: Mutex<Vec<Arc<SoftSlot>>> = Mutex::new(Vec::new());
-static ACTIVE_SOFT_MASK: AtomicU16 = AtomicU16::new(0);
-static HOOK_STATE: Mutex<Option<(u32, std::thread::JoinHandle<()>)>> = Mutex::new(None);
-
-/// Rebuild the slot table from the config (slot i = key F13 + i, same order as `Config::soft_macro_slots`),
-/// then activate only the slots permitted in the current foreground profile.
-fn load_soft_macros(cfg: &Config, game_key: Option<&str>, onboard_macros: bool) {
-    let slots: Vec<Arc<SoftSlot>> = cfg
-        .soft_macro_slots()
-        .into_iter()
-        .map(|(id, play)| {
-            let events = cfg.macro_by_id(id).and_then(|m| m.events().ok()).unwrap_or_default();
-            Arc::new(SoftSlot {
-                events: Arc::new(events),
-                play,
-                stop: Mutex::new(Arc::new(AtomicBool::new(false))),
-                run_lock: Mutex::new(()),
-                running: AtomicBool::new(false),
-                down: AtomicBool::new(false),
-                seq: AtomicUsize::new(0),
-            })
-        })
-        .collect();
-    {
-        let mut table = SOFT.lock().unwrap_or_else(|e| e.into_inner());
-        for s in table.iter() {
-            s.running.store(false, Ordering::Relaxed);
-            s.down.store(false, Ordering::Relaxed);
-            s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
-        }
-        *table = slots;
-    }
-    update_active_soft_macros(cfg, game_key, onboard_macros);
-}
-
-/// Recompute which software-macro slots are allowed in the current foreground profile
-/// (`None` = desktop, `Some(key)` = active game), cancelling disallowed loops and toggling `WH_KEYBOARD_LL`.
-fn update_active_soft_macros(cfg: &Config, game_key: Option<&str>, onboard_macros: bool) {
-    let mask = cfg.active_soft_slot_mask(game_key, onboard_macros);
-    apply_active_soft_mask(mask);
-}
-
-fn apply_active_soft_mask(mask: u16) {
-    ACTIVE_SOFT_MASK.store(mask, Ordering::Relaxed);
-    {
-        let table = SOFT.lock().unwrap_or_else(|e| e.into_inner());
-        for (i, s) in table.iter().enumerate() {
-            if i >= 12 || (mask & (1u16 << i)) == 0 {
-                s.running.store(false, Ordering::Relaxed);
-                s.down.store(false, Ordering::Relaxed);
-                s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
-            }
-        }
-    }
-    sync_macro_hook(mask != 0);
-}
-
-/// Start the `WH_KEYBOARD_LL` hook thread on demand when `need` is true, and
-/// cleanly `UnhookWindowsHookEx` + join the thread when no software macros are active.
-fn sync_macro_hook(need: bool) {
-    let mut guard = HOOK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if need {
-        if guard.is_none() {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<u32, ()>>(1);
-            let handle = std::thread::spawn(move || unsafe {
-                let tid = GetCurrentThreadId();
-                let mut msg: MSG = mem::zeroed();
-                // Ensure the thread message queue exists before publishing `tid` so WM_QUIT never races.
-                PeekMessageW(&mut msg, 0, WM_USER, WM_USER, PM_NOREMOVE);
-                let hhook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(ptr::null()), 0);
-                if hhook == 0 {
-                    let _ = tx.send(Err(()));
-                    return;
-                }
-                if tx.send(Ok(tid)).is_err() {
-                    UnhookWindowsHookEx(hhook);
-                    return;
-                }
-                while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-                UnhookWindowsHookEx(hhook);
-            });
-            if let Ok(Ok(tid)) = rx.recv() {
-                *guard = Some((tid, handle));
-            }
-        }
-    } else if let Some((tid, handle)) = guard.take() {
-        let posted = unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) != 0 };
-        drop(guard);
-        if posted {
-            let _ = handle.join();
-        }
-    }
-}
-
-unsafe extern "system" fn kb_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        let k = &*(lparam as *const KBDLLHOOKSTRUCT);
-        let own = k.dwExtraInfo == player::INJECT_MARK;
-        if !own && (player::VK_F13 as u32..=player::VK_F24 as u32).contains(&k.vkCode) {
-            let slot = (k.vkCode - player::VK_F13 as u32) as usize;
-            let down = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
-            let active = slot < 12 && (ACTIVE_SOFT_MASK.load(Ordering::Relaxed) & (1u16 << slot)) != 0;
-            let s = SOFT.lock().ok().and_then(|t| t.get(slot).cloned());
-            if let Some(s) = s {
-                if active || (!down && s.down.load(Ordering::Relaxed)) {
-                    soft_trigger(&s, down);
-                    return 1;
-                }
-            }
-        }
-    }
-    CallNextHookEx(0, code, wparam, lparam)
-}
-
-/// Start a fresh stop flag for a playback run, ending the previous one.
-fn new_run(s: &SoftSlot) -> Arc<AtomicBool> {
-    let mut g = s.stop.lock().unwrap_or_else(|e| e.into_inner());
-    g.store(true, Ordering::Relaxed);
-    *g = Arc::new(AtomicBool::new(false));
-    g.clone()
-}
-
-fn soft_trigger(s: &Arc<SoftSlot>, down: bool) {
-    let was_down = s.down.swap(down, Ordering::Relaxed);
-    if down && was_down {
-        return; // keyboard auto-repeat of the held key
-    }
-    if down && s.events.is_empty() {
-        return;
-    }
-    match s.play {
-        Playback::Times(n) => {
-            if down {
-                let s = s.clone();
-                let stop = new_run(&s);
-                std::thread::spawn(move || {
-                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    for _ in 0..n.max(1) {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        player::play(&s.events, &stop);
-                    }
-                });
-            }
-        }
-        Playback::Held => {
-            if down {
-                let s = s.clone();
-                let stop = new_run(&s);
-                std::thread::spawn(move || {
-                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    if player::has_launch(&s.events) {
-                        player::play(&s.events, &stop);
-                        return;
-                    }
-                    let need_yield = player::loop_needs_yield(&s.events);
-                    while !stop.load(Ordering::Relaxed) {
-                        player::play(&s.events, &stop);
-                        if need_yield && !stop.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                });
-            } else {
-                s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
-            }
-        }
-        Playback::Toggle => {
-            if !down {
-                return;
-            }
-            if s.running.swap(false, Ordering::Relaxed) {
-                s.stop.lock().unwrap_or_else(|e| e.into_inner()).store(true, Ordering::Relaxed);
-            } else {
-                s.running.store(true, Ordering::Relaxed);
-                let s = s.clone();
-                let stop = new_run(&s);
-                std::thread::spawn(move || {
-                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    if player::has_launch(&s.events) {
-                        player::play(&s.events, &stop);
-                        s.running.store(false, Ordering::Relaxed);
-                        return;
-                    }
-                    let need_yield = player::loop_needs_yield(&s.events);
-                    while !stop.load(Ordering::Relaxed) {
-                        player::play(&s.events, &stop);
-                        if need_yield && !stop.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                    s.running.store(false, Ordering::Relaxed);
-                });
-            }
-        }
-        Playback::Sequence => {
-            if down {
-                let steps = player::sequence_steps(&s.events);
-                if steps.is_empty() {
-                    return;
-                }
-                let k = s.seq.fetch_add(1, Ordering::Relaxed) % steps.len();
-                let step = steps[k].clone();
-                let s = s.clone();
-                let stop = new_run(&s);
-                std::thread::spawn(move || {
-                    let _run = s.run_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    player::play(&step, &stop);
-                });
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,16 +1927,21 @@ unsafe fn canvas_to_icon(c: &Canvas) -> HICON {
 
 #[cfg(test)]
 mod tests {
-    use super::GameSync;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    use super::{FENCE_MAX_WAIT_MS, FENCE_QUIET_HELD_MS, FENCE_STEP_MS, GameSync, HwCache, SyncBackend, SyncStep, sync_game_target};
+    use crate::config::{Config, GameConfig, parse_button};
+    use crate::device::{ButtonFunction, DeviceSpec, DpiStages};
+    use crate::hid::HidError;
+    use crate::protocol::Status;
 
     #[test]
     fn base_reapply_marks_game_dirty_until_foreground_resynced() {
         let mut gs = GameSync::default();
-        // Mouse wakes up after initial retry and applies base layout while a game is already in foreground.
         gs.on_base_applied(true);
         assert!(gs.dirty, "base apply must keep game sync dirty when game rules exist");
         assert!(gs.needs_sync(&Some("c:\\games\\shooter".into())));
-        // Even if foreground turns out to be desktop, one check_game pass confirms and clears dirty.
         assert!(gs.needs_sync(&None));
         gs.begin_sync();
         gs.commit_sync(None);
@@ -1556,17 +1954,14 @@ mod tests {
         let mut gs = GameSync::default();
         gs.commit_sync(None);
 
-        // Entering a game: polling & DPI stage succeeded (active stage 2 -> 1), then button write failed.
         let wanted_game = Some("c:\\games\\shooter".to_string());
         assert!(gs.needs_sync(&wanted_game));
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(Some(1), true, 2), Some(1));
         assert_eq!(gs.stage_before_game, Some(2));
-        // Notice: commit_sync is NOT called because apply_game_buttons returned Err.
         assert_eq!(gs.applied, None);
         assert!(gs.dirty);
 
-        // User Alt+Tabs back to desktop before retry succeeds: must STILL sync and restore stage 2!
         assert!(gs.needs_sync(&None));
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
@@ -1580,31 +1975,225 @@ mod tests {
         let mut gs = GameSync::default();
         gs.commit_sync(None);
 
-        // Desktop at stage 2 -> Game A (no DPI override): leave stage untouched, do not clobber stage_before_game.
         let game_a = Some("game:a".to_string());
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(None, true, 2), None);
         assert_eq!(gs.stage_before_game, None);
         gs.commit_sync(game_a);
 
-        // Game A -> Game B (DPI override stage 4): remember original stage 2 and switch to 4.
         let game_b = Some("game:b".to_string());
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(Some(4), true, 2), Some(4));
         assert_eq!(gs.stage_before_game, Some(2));
         gs.commit_sync(game_b);
 
-        // Game B -> Game C (DPI override stage 1): keep original desktop stage 2!
         let game_c = Some("game:c".to_string());
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(Some(1), true, 4), Some(1));
         assert_eq!(gs.stage_before_game, Some(2));
         gs.commit_sync(game_c);
 
-        // Game C -> Desktop: restore stage 2 and clear saved stage.
         gs.begin_sync();
         assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
         gs.commit_sync(None);
         assert_eq!(gs.stage_before_game, None);
+    }
+
+    struct MockMouse {
+        spec: DeviceSpec,
+        polling: RefCell<u16>,
+        stages: RefCell<DpiStages>,
+        buttons: RefCell<BTreeMap<u8, ButtonFunction>>,
+        ops: RefCell<Vec<String>>,
+        fail_set_button: RefCell<Option<u8>>,
+        on_after_set_polling: RefCell<Option<Box<dyn FnMut()>>>,
+    }
+
+    impl MockMouse {
+        fn new_dav4() -> Self {
+            let spec = DeviceSpec::lookup(0x00BF);
+            let mut buttons = BTreeMap::new();
+            for b in spec.buttons {
+                buttons.insert(b.code, b.default);
+            }
+            buttons.insert(0x04, parse_button("media:mute").unwrap().unwrap());
+            buttons.insert(0x05, parse_button("key:win+d").unwrap().unwrap());
+            MockMouse {
+                spec,
+                polling: RefCell::new(500),
+                stages: RefCell::new(DpiStages { active: 2, stages: vec![(1000, 1000), (3000, 3000)] }),
+                buttons: RefCell::new(buttons),
+                ops: RefCell::new(Vec::new()),
+                fail_set_button: RefCell::new(None),
+                on_after_set_polling: RefCell::new(None),
+            }
+        }
+
+        fn take_ops(&self) -> Vec<String> {
+            std::mem::take(&mut *self.ops.borrow_mut())
+        }
+    }
+
+    impl SyncBackend for MockMouse {
+        fn spec(&self) -> &DeviceSpec {
+            &self.spec
+        }
+        fn profile(&self) -> u8 {
+            1
+        }
+        fn writes_allowed(&self) -> bool {
+            true
+        }
+        fn polling_rate(&self) -> crate::hid::Result<u16> {
+            self.ops.borrow_mut().push("get_polling".into());
+            Ok(*self.polling.borrow())
+        }
+        fn set_polling_rate(&self, hz: u16) -> crate::hid::Result<()> {
+            self.ops.borrow_mut().push(format!("set_polling:{hz}"));
+            *self.polling.borrow_mut() = hz;
+            if let Some(cb) = self.on_after_set_polling.borrow_mut().as_mut() {
+                cb();
+            }
+            Ok(())
+        }
+        fn dpi_stages(&self) -> crate::hid::Result<DpiStages> {
+            self.ops.borrow_mut().push("get_stages".into());
+            Ok(self.stages.borrow().clone())
+        }
+        fn set_dpi_stages(&self, active: u8, stages: &[(u16, u16)]) -> crate::hid::Result<()> {
+            self.ops.borrow_mut().push(format!("set_stages:{active}"));
+            *self.stages.borrow_mut() = DpiStages { active, stages: stages.to_vec() };
+            Ok(())
+        }
+        fn current_button(&self, code: u8, _name: &str, _bound: bool) -> crate::hid::Result<Option<ButtonFunction>> {
+            self.ops.borrow_mut().push(format!("get_btn:{code:02x}"));
+            Ok(self.buttons.borrow().get(&code).copied())
+        }
+        fn set_button(&self, _profile: u8, code: u8, f: ButtonFunction) -> crate::hid::Result<()> {
+            self.ops.borrow_mut().push(format!("set_btn:{code:02x}"));
+            if *self.fail_set_button.borrow() == Some(code) {
+                *self.fail_set_button.borrow_mut() = None;
+                return Err(HidError::Status(Status::Timeout));
+            }
+            self.buttons.borrow_mut().insert(code, f);
+            Ok(())
+        }
+    }
+
+    fn overwatch_config() -> (Config, String) {
+        let mut cfg = Config::default();
+        cfg.dpi.stages = vec![1000, 3000];
+        cfg.dpi.active = 2;
+        cfg.polling.rate = 500;
+        cfg.buttons.insert("back".into(), "media:mute".into());
+        cfg.buttons.insert("forward".into(), "key:win+d".into());
+        let mut g = GameConfig { name: "守望先锋".into(), dir: "D:\\Overwatch".into(), dpi_stage: Some(1), polling: Some(1000), ..Default::default() };
+        g.buttons.insert("back".into(), "key:j".into());
+        g.buttons.insert("forward".into(), "key:f".into());
+        let key = g.key();
+        cfg.games.push(g);
+        (cfg, key)
+    }
+
+    #[test]
+    fn warm_cache_differential_switch_skips_unchanged_reads_and_writes() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        // Desktop -> Overwatch: 1 live get_stages (to preserve physical DPI button choice), 0 button GETs, only changed writes.
+        let step = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+
+        // Overwatch -> Desktop: 0 GETs at all! Only writes polling, stage 2, and the 2 side buttons.
+        let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["set_polling:500", "set_stages:2", "set_btn:04", "set_btn:05"]);
+    }
+
+    #[test]
+    fn cancelled_desktop_switch_converges_back_to_game_without_touching_buttons() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        mock.take_ops();
+
+        let cancel_flag = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag_clone = cancel_flag.clone();
+        *mock.on_after_set_polling.borrow_mut() = Some(Box::new(move || flag_clone.set(true)));
+        let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || cancel_flag.get(), |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Cancelled);
+        assert_eq!(mock.take_ops(), vec!["set_polling:500"]);
+        assert_eq!(gs.stage_before_game, Some(2), "saved desktop DPI stage must survive cancelled exit");
+
+        *mock.on_after_set_polling.borrow_mut() = None;
+        let step = sync_game_target(&mock, &cfg, &Some(ow_key), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000"]);
+        assert_eq!(gs.stage_before_game, Some(2));
+    }
+
+    #[test]
+    fn held_win_d_shortcut_delays_switch_until_quiet_and_defers_on_timeout() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        let mut slept_ms = 0u64;
+        let step = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |vks| vks.contains(&0x5b), || false, |ms| slept_ms += ms).unwrap();
+        assert_eq!(step, SyncStep::Deferred);
+        assert!(slept_ms >= FENCE_MAX_WAIT_MS);
+        assert!(mock.take_ops().is_empty(), "must never rewrite mouse while Win+D is held down");
+        assert!(gs.dirty);
+
+        let elapsed = std::cell::Cell::new(0u64);
+        let step = sync_game_target(
+            &mock,
+            &cfg,
+            &Some(ow_key),
+            &mut gs,
+            &mut hw,
+            |vks| elapsed.get() <= 3 * FENCE_STEP_MS && vks.contains(&0x44),
+            || false,
+            |ms| elapsed.set(elapsed.get() + ms),
+        )
+        .unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(elapsed.get(), 3 * FENCE_STEP_MS + FENCE_QUIET_HELD_MS);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+    }
+
+    #[test]
+    fn partial_button_timeout_invalidates_only_failed_button() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None);
+
+        *mock.fail_set_button.borrow_mut() = Some(0x05);
+        let res = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {});
+        assert!(res.is_err());
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+        assert!(gs.dirty);
+        assert!(!hw.buttons.contains_key(&0x05), "timed-out button must be marked unknown");
+        assert!(hw.buttons.contains_key(&0x04), "already-written button stays cached");
+
+        let step = sync_game_target(&mock, &cfg, &Some(ow_key), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["get_btn:05", "set_btn:05"]);
     }
 }

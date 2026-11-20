@@ -1,6 +1,6 @@
 [package]
 name = "freenapse"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 authors = ["MatthewSaintbull"]
 description = "Freenapse-DeathAdder V4 Pro: lightweight native onboard driver & tray app for Razer DeathAdder V4 Pro (based on freenapse)"
