@@ -40,7 +40,7 @@
 2. **新增二代半球形接收器协议**：实现 `tid 0xff` 下固件/序列号读取、3 颗指示灯独立映射（`07/15`、`07/95`）与亮度调节（`07/16`、`07/96`），并加入单灯异步读取保护防止覆盖其余灯位。
 3. **适配 V4 Pro 传感器非对称高度回读**：解析 `0b/85/0b` 报文校验抬起/着陆等级，实现配置一致时零重复 `SET` 写入，同时兼容旧机型写入策略。
 4. **移除宏功能，回归 100% 纯板载**：彻底删除宏录制/播放、软件启动程序、文本输入以及多余的「纯板载反作弊模式」开关，全工程完全去除 `WH_KEYBOARD_LL` 全局键盘钩子与 `SendInput` 模拟输入，单文件体积进一步缩减至 `1.0 MB`，对各类游戏反作弊彻底透明。
-5. **异步增量切屏与防卡键优化**：采用 `SetWinEventHook` 零轮询事件通知 + 独立后台设备工作线程，支持快速切屏**最新目标合并抢占**、**`HwCache` 字段级增量写入**（未改动键位零读写，切屏提速约 3 倍）以及 **`Win+D` 等组合键松开静默护栏**（彻底解决切屏瞬间按侧键导致的修饰键粘连）。
+5. **异步增量切屏、确定性 DPI 跟随与防卡键优化**：采用 `SetWinEventHook` 零轮询事件通知 + 独立后台设备工作线程，支持快速切屏**最新目标合并抢占**、**`HwCache` 字段级增量写入**（进出游戏双向零冗余读取，仅写变动项）、**游戏/桌面 DPI 档位与实时传感器 XY 值双重确定性同步**、**仅响应雷蛇 `VID_1532` 热插拔**（不受耳机/手柄等无关 HID 外设干扰）以及 **`Win+D` 等组合键松开静默护栏**（彻底解决切屏瞬间按侧键导致的修饰键粘连）。
 6. **全中文界面与极简托盘菜单**：重绘 V4 Pro 右手人体工学俯视图与底部按键，新增板载「桌面快捷」分类与「开机自启」开关；大幅精简托盘右键菜单，仅保留状态摘要、打开控制中心、开机自启与退出四项核心操作。
 7. **健壮性与隐私保护**：默认关闭启动外网更新检查；完善瞬态 HID 读失败错误传播，默认对界面与命令行的鼠标序列号及系统用户目录路径脱敏。
 
@@ -91,7 +91,7 @@ Full protocol support unlocked and verified on **Razer DeathAdder V4 Pro (`1532:
 2. **HyperSpeed Gen-2 Dome Dongle Protocol**: Implemented `tid 0xff` firmware/serial queries, 3-LED slot mapping (`07/15`, `07/95`), brightness control (`07/16`, `07/96`), and single-slot read-before-patch protection.
 3. **Focus Pro Gen-2 Asymmetric Readback**: Added `0b/85/0b` lift/land level readback verification for zero redundant `SET` writes on V4 Pro while preserving pre-write compatibility for older models.
 4. **Removed Macros for Pure 100% Onboard Operation**: Completely removed macro recording/playback, software app launch / text typing, `WH_KEYBOARD_LL` keyboard hooks, and `SendInput` injection — shrinking the binary to `1.0 MB` with zero input-path overhead.
-5. **Fast Non-Blocking Differential Profile Switching**: Event-driven foreground detection (`SetWinEventHook`) paired with a dedicated background HID worker featuring latest-target preemption, `HwCache` field-level differential writes (~3x faster switching), and a shortcut-release fence (`Win+D` stuck-key prevention).
+5. **Fast Non-Blocking Differential Profile Switching**: Event-driven foreground detection (`SetWinEventHook`) paired with a dedicated background HID worker featuring latest-target preemption, `HwCache` field-level differential writes, deterministic game/desktop DPI stage + live XY sensor synchronization, `VID_1532`-scoped hotplug filtering, and a shortcut-release fence (`Win+D` stuck-key prevention).
 6. **Ergonomic UI & Minimalist Tray Menu**: Re-illustrated right-handed DeathAdder V4 Pro top/bottom views, added onboard Windows shortcut presets, and streamlined the tray right-click menu to four essentials (status summary, open settings, autostart, quit).
 7. **Resilience & Privacy**: Disabled startup update checks by default, propagated transient HID read errors cleanly, and masked hardware serial numbers and `%USERPROFILE%` paths by default.
 

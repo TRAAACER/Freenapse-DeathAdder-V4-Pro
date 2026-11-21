@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,14 +71,15 @@ struct GameSync {
     applied: Option<String>,
     /// True while hardware may hold a partial/unconfirmed game layout, or right after base `apply()` ran.
     dirty: bool,
-    /// User's DPI stage before the first game DPI override took effect; restored when leaving DPI-overridden games.
-    stage_before_game: Option<u8>,
+    /// True once a game DPI override started and before desktop DPI (`cfg.dpi.active`) is confirmed restored.
+    dpi_overridden: bool,
 }
 
 impl GameSync {
     fn on_base_applied(&mut self, has_rules: bool) {
         self.applied = None;
         self.dirty = has_rules;
+        self.dpi_overridden = false;
     }
 
     fn needs_sync(&self, wanted: &Option<String>) -> bool {
@@ -89,24 +90,23 @@ impl GameSync {
         self.dirty = true;
     }
 
-    /// Decide which 1-based DPI stage to write (`None` = leave DPI stage untouched),
-    /// persistently recording `stage_before_game` before the first game DPI override.
-    fn plan_dpi_stage(&mut self, game_stage: Option<u8>, has_game: bool, current_active: u8) -> Option<u8> {
+    /// Decide which 1-based DPI stage to write (`None` = no game rule touches DPI).
+    /// Uses `desktop_active` (`cfg.dpi.active`) deterministically whenever leaving a game or switching
+    /// to a game without its own `dpi_stage`, so mid-game device reopens or restarts never poison desktop DPI.
+    fn plan_dpi_stage(&mut self, desktop_active: u8, game_stage: Option<u8>, has_dpi_rules: bool) -> Option<u8> {
         match game_stage {
             Some(s) => {
-                if self.stage_before_game.is_none() {
-                    self.stage_before_game = Some(current_active);
-                }
+                self.dpi_overridden = true;
                 Some(s)
             }
-            None if has_game => None,
-            None => self.stage_before_game,
+            None if has_dpi_rules || self.dpi_overridden => Some(desktop_active),
+            None => None,
         }
     }
 
-    fn commit_sync(&mut self, wanted: Option<String>) {
-        if wanted.is_none() {
-            self.stage_before_game = None;
+    fn commit_sync(&mut self, wanted: Option<String>, game_stage: Option<u8>) {
+        if game_stage.is_none() {
+            self.dpi_overridden = false;
         }
         self.applied = wanted;
         self.dirty = false;
@@ -119,6 +119,7 @@ impl GameSync {
 struct HwCache {
     polling: Option<u16>,
     stages: Option<DpiStages>,
+    dpi: Option<(u16, u16)>,
     /// Per physical button code: `Some(f)` = confirmed function, `None` = button absent on this unit.
     buttons: BTreeMap<u8, Option<ButtonFunction>>,
 }
@@ -127,13 +128,15 @@ impl HwCache {
     fn clear(&mut self) {
         self.polling = None;
         self.stages = None;
+        self.dpi = None;
         self.buttons.clear();
     }
 
     /// Populate known base-layout values right after a full `apply::apply` succeeded on a verified mouse.
-    fn seed_from_base(&mut self, spec: &DeviceSpec, cfg: &Config, polling: u16, stages: Option<DpiStages>) {
+    fn seed_from_base(&mut self, spec: &DeviceSpec, cfg: &Config, polling: u16, stages: Option<DpiStages>, dpi: Option<(u16, u16)>) {
         self.polling = Some(polling);
         self.stages = stages;
+        self.dpi = dpi;
         if spec.verified {
             for b in spec.buttons {
                 let (func, _) = apply::normal_button_target(cfg, None, b);
@@ -230,6 +233,13 @@ struct App {
 }
 
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+static GAME_MODE_UNSETTLED: AtomicBool = AtomicBool::new(false);
+
+/// True while the tray is running and either inside a game profile or mid-transition
+/// (debouncing, waiting on the shortcut fence, or restoring desktop settings).
+pub(crate) fn is_game_mode_unsettled() -> bool {
+    TRAY_HWND.load(Ordering::Relaxed) != 0 && GAME_MODE_UNSETTLED.load(Ordering::Relaxed)
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -469,6 +479,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             TRAY_HWND.store(0, Ordering::Relaxed);
+            GAME_MODE_UNSETTLED.store(false, Ordering::Relaxed);
             let app = app_from(hwnd);
             if !app.is_null() {
                 (*app).unhook_fg();
@@ -527,8 +538,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_DEVICECHANGE => {
                     let event = wparam as u32;
                     if event == DBT_DEVICEARRIVAL {
-                        // The interface exists before the device answers: look again shortly.
-                        SetTimer(hwnd, TIMER_REPLUG, 1500, None);
+                        if broadcast_interface_name(lparam).is_some_and(|n| n.to_ascii_lowercase().contains("vid_1532")) {
+                            // A Razer HID interface arrived (dongle plugged in or USB-C cable attached): look again shortly.
+                            SetTimer(hwnd, TIMER_REPLUG, 1500, None);
+                        }
                     } else if event == DBT_DEVICEREMOVECOMPLETE {
                         if let Some(name) = broadcast_interface_name(lparam) {
                             (*app).notify_unplugged(name);
@@ -604,7 +617,13 @@ impl App {
         }
     }
 
+    fn update_game_mode_flag(&self) {
+        let unsettled = self.wanted_game.is_some() || self.game_applied.is_some() || self.game_dirty || (self.has_game_rules() && !self.config_applied);
+        GAME_MODE_UNSETTLED.store(unsettled, Ordering::Relaxed);
+    }
+
     unsafe fn update_tray(&mut self) {
+        self.update_game_mode_flag();
         self.set_icon();
         let mut tip = format!("Freenapse-DeathAdder V4 Pro ({})", crate::VERSION);
         match (self.battery, self.mouse_connected) {
@@ -851,6 +870,7 @@ impl App {
     unsafe fn check_game(&mut self) {
         if !self.has_game_rules() && !self.game_dirty && self.game_applied.is_none() {
             self.wanted_game = None;
+            self.update_game_mode_flag();
             return;
         }
         let path = match query_foreground() {
@@ -888,6 +908,7 @@ impl App {
                 false
             }
         };
+        self.update_game_mode_flag();
         if need_notify {
             self.shared.cvar.notify_one();
         }
@@ -1102,6 +1123,7 @@ trait SyncBackend {
     fn writes_allowed(&self) -> bool;
     fn polling_rate(&self) -> crate::hid::Result<u16>;
     fn set_polling_rate(&self, hz: u16) -> crate::hid::Result<()>;
+    fn dpi(&self) -> crate::hid::Result<(u16, u16)>;
     fn dpi_stages(&self) -> crate::hid::Result<DpiStages>;
     fn set_dpi_stages(&self, active: u8, stages: &[(u16, u16)]) -> crate::hid::Result<()>;
     fn current_button(&self, code: u8, name: &str, bound: bool) -> crate::hid::Result<Option<ButtonFunction>>;
@@ -1123,6 +1145,9 @@ impl SyncBackend for Mouse {
     }
     fn set_polling_rate(&self, hz: u16) -> crate::hid::Result<()> {
         Mouse::set_polling_rate(self, hz)
+    }
+    fn dpi(&self) -> crate::hid::Result<(u16, u16)> {
+        Mouse::dpi(self)
     }
     fn dpi_stages(&self) -> crate::hid::Result<DpiStages> {
         Mouse::dpi_stages(self)
@@ -1262,7 +1287,7 @@ fn sync_game_target(
     }
     game.begin_sync();
     if !mouse.writes_allowed() {
-        game.commit_sync(wanted.clone());
+        game.commit_sync(wanted.clone(), None);
         return Ok(SyncStep::Committed);
     }
     if is_cancelled() {
@@ -1306,27 +1331,37 @@ fn sync_game_target(
         }
     }
 
-    // 2. DPI stage: read live stages once before the first game DPI override so a stage picked with the
-    // physical DPI button on desktop is preserved in `stage_before_game`; leaving a game needs zero GETs.
-    if is_cancelled() {
-        return Ok(SyncStep::Cancelled);
-    }
-    let need_live_stage_read = hw.stages.is_none() || (game.stage_before_game.is_none() && game_stage.is_some());
-    let st = if need_live_stage_read {
-        let s = mouse.dpi_stages()?;
-        hw.stages = Some(s.clone());
-        s
-    } else {
-        hw.stages.clone().unwrap()
-    };
-    let target_stage = game.plan_dpi_stage(game_stage, over.is_some(), st.active);
-    if let Some(stage) = target_stage.filter(|s| *s != st.active && (1..=st.stages.len() as u8).contains(s)) {
-        if is_cancelled() {
-            return Ok(SyncStep::Cancelled);
+    // 2. DPI stage + live `(x, y)` sensor DPI: deterministic (`game_stage` in-game, `cfg.dpi.active` on desktop),
+    // verifying both stage table (`04/86`) and live XY DPI (`04/85`) when cold, with zero GETs when warm.
+    let want_stages = cfg.stage_pairs();
+    let desktop_active = cfg.dpi.active.clamp(1, want_stages.len() as u8);
+    let has_dpi_rules = cfg.games.iter().any(|g| g.dpi_stage.is_some());
+    if let Some(stage) = game.plan_dpi_stage(desktop_active, game_stage, has_dpi_rules).filter(|s| (1..=want_stages.len() as u8).contains(s)) {
+        let want_dpi = want_stages[stage as usize - 1];
+        if hw.stages.is_none() {
+            if is_cancelled() {
+                return Ok(SyncStep::Cancelled);
+            }
+            hw.stages = Some(mouse.dpi_stages()?);
         }
-        hw.stages = None;
-        mouse.set_dpi_stages(stage, &st.stages)?;
-        hw.stages = Some(DpiStages { active: stage, stages: st.stages });
+        if hw.dpi.is_none() {
+            if is_cancelled() {
+                return Ok(SyncStep::Cancelled);
+            }
+            hw.dpi = Some(mouse.dpi()?);
+        }
+        let stages_ok = hw.stages.as_ref().is_some_and(|s| s.active == stage && s.stages == want_stages);
+        let dpi_ok = hw.dpi == Some(want_dpi);
+        if !stages_ok || !dpi_ok {
+            if is_cancelled() {
+                return Ok(SyncStep::Cancelled);
+            }
+            hw.stages = None;
+            hw.dpi = None;
+            mouse.set_dpi_stages(stage, &want_stages)?;
+            hw.stages = Some(DpiStages { active: stage, stages: want_stages });
+            hw.dpi = Some(want_dpi);
+        }
     }
 
     // 3. Normal-layer buttons: skip every button whose cached assignment already equals `want_func`,
@@ -1373,7 +1408,7 @@ fn sync_game_target(
     if is_cancelled() {
         return Ok(SyncStep::Cancelled);
     }
-    game.commit_sync(wanted.clone());
+    game.commit_sync(wanted.clone(), game_stage);
     Ok(SyncStep::Committed)
 }
 
@@ -1467,10 +1502,8 @@ fn worker_loop(hwnd: HWND, shared: Arc<WorkerShared>) {
                     let model_name = Some(m.spec().name.to_string());
                     let cfg_file = config_path();
                     hw.clear();
-                    game = GameSync::default();
-                    if work.has_game_rules {
-                        game.begin_sync();
-                    }
+                    let was_dpi_overridden = game.dpi_overridden || game.applied.is_some();
+                    game = GameSync { applied: None, dirty: work.has_game_rules || was_dpi_overridden, dpi_overridden: was_dpi_overridden };
                     mouse = Some(m);
                     shared.push_report(hwnd, WorkerReport::Device { connected: true, model_name, config_file: cfg_file, unplugged_error: false });
                 }
@@ -1489,7 +1522,8 @@ fn worker_loop(hwnd: HWND, shared: Arc<WorkerShared>) {
             match apply::import(m) {
                 Ok(cfg) => {
                     let stages = m.dpi_stages().ok();
-                    hw.seed_from_base(m.spec(), &cfg, cfg.polling.rate, stages);
+                    let dpi = m.dpi().ok();
+                    hw.seed_from_base(m.spec(), &cfg, cfg.polling.rate, stages, dpi);
                     game.on_base_applied(!cfg.games.is_empty() || !cfg.polling.games.is_empty());
                     {
                         let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
@@ -1521,8 +1555,11 @@ fn worker_loop(hwnd: HWND, shared: Arc<WorkerShared>) {
                 let base_polling = work.config.polling.rate;
                 match apply::apply(m, &work.config, base_polling) {
                     Ok(changes) => {
-                        let stages = m.dpi_stages().ok();
-                        hw.seed_from_base(m.spec(), &work.config, base_polling, stages.clone());
+                        let want_stages = work.config.stage_pairs();
+                        let want_active = work.config.dpi.active.clamp(1, want_stages.len() as u8);
+                        let want_dpi = want_stages.get(want_active as usize - 1).copied();
+                        let stages = Some(DpiStages { active: want_active, stages: want_stages });
+                        hw.seed_from_base(m.spec(), &work.config, base_polling, stages.clone(), want_dpi);
                         game.on_base_applied(work.has_game_rules);
                         {
                             let mut g = shared.goal.lock().unwrap_or_else(|e| e.into_inner());
@@ -1641,13 +1678,23 @@ fn worker_loop(hwnd: HWND, shared: Arc<WorkerShared>) {
             match m.battery() {
                 Ok(bat) => {
                     backoff = false;
-                    let stages = m.dpi_stages().ok().or_else(|| hw.stages.clone());
-                    if stages.is_some() {
-                        hw.stages = stages.clone();
+                    let mut stages = hw.stages.clone();
+                    if shared.goal.lock().unwrap_or_else(|e| e.into_inner()).epoch == work.epoch {
+                        if let Ok(s) = m.dpi_stages() {
+                            let stage_changed = hw.stages.as_ref() != Some(&s);
+                            hw.stages = Some(s.clone());
+                            stages = Some(s);
+                            if (hw.dpi.is_none() || stage_changed)
+                                && let Ok(d) = m.dpi()
+                            {
+                                hw.dpi = Some(d);
+                            }
+                        }
                     }
                     let polling = match hw.polling {
                         Some(p) => Some(p),
-                        None => m.polling_rate().ok(),
+                        None if shared.goal.lock().unwrap_or_else(|e| e.into_inner()).epoch == work.epoch => m.polling_rate().ok(),
+                        None => None,
                     };
                     if polling.is_some() {
                         hw.polling = polling;
@@ -1757,7 +1804,9 @@ unsafe fn broadcast_interface_name(lparam: LPARAM) -> Option<String> {
 /// A thread that posts `WM_CONFIG_FILE` whenever something in the config
 /// folder is written. The tray then decides whether the config file changed.
 fn watch_config(hwnd: HWND) {
-    let Some(dir) = config_path().parent().map(|p| p.to_path_buf()) else { return };
+    let Some(dir) = config_path().parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
     let _ = std::fs::create_dir_all(&dir);
     std::thread::spawn(move || unsafe {
         use windows_sys::Win32::Storage::FileSystem::{
@@ -1944,7 +1993,7 @@ mod tests {
         assert!(gs.needs_sync(&Some("c:\\games\\shooter".into())));
         assert!(gs.needs_sync(&None));
         gs.begin_sync();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
         assert!(!gs.dirty);
         assert!(!gs.needs_sync(&None));
     }
@@ -1952,59 +2001,62 @@ mod tests {
     #[test]
     fn partial_game_failure_still_restores_base_and_dpi_on_exit() {
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
         let wanted_game = Some("c:\\games\\shooter".to_string());
         assert!(gs.needs_sync(&wanted_game));
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(Some(1), true, 2), Some(1));
-        assert_eq!(gs.stage_before_game, Some(2));
+        assert_eq!(gs.plan_dpi_stage(2, Some(1), true), Some(1));
+        assert!(gs.dpi_overridden);
         assert_eq!(gs.applied, None);
         assert!(gs.dirty);
 
         assert!(gs.needs_sync(&None));
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
-        gs.commit_sync(None);
-        assert_eq!(gs.stage_before_game, None);
+        assert_eq!(gs.plan_dpi_stage(2, None, true), Some(2));
+        gs.commit_sync(None, None);
+        assert!(!gs.dpi_overridden);
         assert!(!gs.dirty);
     }
 
     #[test]
-    fn stage_before_game_survives_across_multiple_games() {
+    fn desktop_dpi_stage_is_restored_across_multiple_games() {
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
         let game_a = Some("game:a".to_string());
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(None, true, 2), None);
-        assert_eq!(gs.stage_before_game, None);
-        gs.commit_sync(game_a);
+        assert_eq!(gs.plan_dpi_stage(2, None, false), None);
+        assert!(!gs.dpi_overridden);
+        gs.commit_sync(game_a, None);
 
         let game_b = Some("game:b".to_string());
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(Some(4), true, 2), Some(4));
-        assert_eq!(gs.stage_before_game, Some(2));
-        gs.commit_sync(game_b);
+        assert_eq!(gs.plan_dpi_stage(2, Some(4), true), Some(4));
+        assert!(gs.dpi_overridden);
+        gs.commit_sync(game_b, Some(4));
 
+        // Switching to a game without its own `dpi_stage` restores desktop stage 2 immediately.
         let game_c = Some("game:c".to_string());
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(Some(1), true, 4), Some(1));
-        assert_eq!(gs.stage_before_game, Some(2));
-        gs.commit_sync(game_c);
+        assert_eq!(gs.plan_dpi_stage(2, None, true), Some(2));
+        gs.commit_sync(game_c, None);
+        assert!(!gs.dpi_overridden);
 
         gs.begin_sync();
-        assert_eq!(gs.plan_dpi_stage(None, false, 1), Some(2));
-        gs.commit_sync(None);
-        assert_eq!(gs.stage_before_game, None);
+        assert_eq!(gs.plan_dpi_stage(2, None, true), Some(2));
+        gs.commit_sync(None, None);
+        assert!(!gs.dpi_overridden);
     }
 
     struct MockMouse {
         spec: DeviceSpec,
         polling: RefCell<u16>,
+        dpi: RefCell<(u16, u16)>,
         stages: RefCell<DpiStages>,
         buttons: RefCell<BTreeMap<u8, ButtonFunction>>,
         ops: RefCell<Vec<String>>,
+        fail_set_dpi_xy_once: RefCell<bool>,
         fail_set_button: RefCell<Option<u8>>,
         on_after_set_polling: RefCell<Option<Box<dyn FnMut()>>>,
     }
@@ -2021,9 +2073,11 @@ mod tests {
             MockMouse {
                 spec,
                 polling: RefCell::new(500),
+                dpi: RefCell::new((3000, 3000)),
                 stages: RefCell::new(DpiStages { active: 2, stages: vec![(1000, 1000), (3000, 3000)] }),
                 buttons: RefCell::new(buttons),
                 ops: RefCell::new(Vec::new()),
+                fail_set_dpi_xy_once: RefCell::new(false),
                 fail_set_button: RefCell::new(None),
                 on_after_set_polling: RefCell::new(None),
             }
@@ -2056,6 +2110,10 @@ mod tests {
             }
             Ok(())
         }
+        fn dpi(&self) -> crate::hid::Result<(u16, u16)> {
+            self.ops.borrow_mut().push("get_dpi".into());
+            Ok(*self.dpi.borrow())
+        }
         fn dpi_stages(&self) -> crate::hid::Result<DpiStages> {
             self.ops.borrow_mut().push("get_stages".into());
             Ok(self.stages.borrow().clone())
@@ -2063,6 +2121,13 @@ mod tests {
         fn set_dpi_stages(&self, active: u8, stages: &[(u16, u16)]) -> crate::hid::Result<()> {
             self.ops.borrow_mut().push(format!("set_stages:{active}"));
             *self.stages.borrow_mut() = DpiStages { active, stages: stages.to_vec() };
+            if *self.fail_set_dpi_xy_once.borrow() {
+                *self.fail_set_dpi_xy_once.borrow_mut() = false;
+                return Err(HidError::Status(Status::Timeout));
+            }
+            if let Some(&xy) = stages.get(active.saturating_sub(1) as usize) {
+                *self.dpi.borrow_mut() = xy;
+            }
             Ok(())
         }
         fn current_button(&self, code: u8, _name: &str, _bound: bool) -> crate::hid::Result<Option<ButtonFunction>> {
@@ -2100,19 +2165,77 @@ mod tests {
         let (cfg, ow_key) = overwatch_config();
         let mock = MockMouse::new_dav4();
         let mut hw = HwCache::default();
-        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
-        // Desktop -> Overwatch: 1 live get_stages (to preserve physical DPI button choice), 0 button GETs, only changed writes.
+        // Desktop -> Overwatch: 0 GETs at all! Only writes polling, stage 1 (1000 DPI), and the 2 side buttons.
         let step = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
         assert_eq!(step, SyncStep::Committed);
-        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "set_stages:1", "set_btn:04", "set_btn:05"]);
+        assert_eq!(*mock.dpi.borrow(), (1000, 1000));
 
-        // Overwatch -> Desktop: 0 GETs at all! Only writes polling, stage 2, and the 2 side buttons.
+        // Overwatch -> Desktop: 0 GETs at all! Only writes polling, stage 2 (3000 DPI), and the 2 side buttons.
         let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
         assert_eq!(step, SyncStep::Committed);
         assert_eq!(mock.take_ops(), vec!["set_polling:500", "set_stages:2", "set_btn:04", "set_btn:05"]);
+        assert_eq!(*mock.dpi.borrow(), (3000, 3000));
+    }
+
+    #[test]
+    fn mid_game_reopen_or_restart_never_poisons_desktop_dpi_on_exit() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None, None);
+
+        // Enter Overwatch -> mouse is now at Stage 1 (1000 DPI), back=J, forward=F.
+        sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        mock.take_ops();
+        assert_eq!(mock.stages.borrow().active, 1);
+        assert_eq!(*mock.dpi.borrow(), (1000, 1000));
+
+        // Simulate device reopen or app restart mid-game (cache cleared, GameSync fresh while hardware is ALREADY at Stage 1!).
+        hw.clear();
+        gs = GameSync { applied: None, dirty: true, dpi_overridden: false };
+        let step = sync_game_target(&mock, &cfg, &Some(ow_key), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        mock.take_ops();
+
+        // Exit Overwatch to Desktop -> MUST restore Stage 2 (3000 DPI) as well as buttons!
+        let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["set_polling:500", "set_stages:2", "set_btn:04", "set_btn:05"]);
+        assert_eq!(mock.stages.borrow().active, 2);
+        assert_eq!(*mock.dpi.borrow(), (3000, 3000));
+    }
+
+    #[test]
+    fn partial_dpi_xy_timeout_retries_set_stages_even_when_stage_index_updated() {
+        let (cfg, ow_key) = overwatch_config();
+        let mock = MockMouse::new_dav4();
+        let mut hw = HwCache::default();
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
+        let mut gs = GameSync::default();
+        gs.commit_sync(None, None);
+
+        sync_game_target(&mock, &cfg, &Some(ow_key), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        mock.take_ops();
+
+        // Simulate `04/06` updating `stages.active = 2` while `04/05` (`set_dpi_xy`) times out leaving live DPI at `(1000, 1000)`.
+        *mock.fail_set_dpi_xy_once.borrow_mut() = true;
+        let res = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || false, |_| {});
+        assert!(res.is_err());
+        assert_eq!(mock.stages.borrow().active, 2);
+        assert_eq!(*mock.dpi.borrow(), (1000, 1000));
+
+        // Next retry detects `dpi != (3000, 3000)` and re-runs `set_stages:2` to bring live DPI in sync.
+        let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
+        assert_eq!(step, SyncStep::Committed);
+        assert_eq!(mock.take_ops(), vec!["set_polling:500", "set_stages:2", "get_stages", "get_dpi", "set_stages:2", "set_btn:04", "set_btn:05"]);
+        assert_eq!(*mock.dpi.borrow(), (3000, 3000));
     }
 
     #[test]
@@ -2120,9 +2243,9 @@ mod tests {
         let (cfg, ow_key) = overwatch_config();
         let mock = MockMouse::new_dav4();
         let mut hw = HwCache::default();
-        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
         sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
         mock.take_ops();
@@ -2133,13 +2256,11 @@ mod tests {
         let step = sync_game_target(&mock, &cfg, &None, &mut gs, &mut hw, |_| false, || cancel_flag.get(), |_| {}).unwrap();
         assert_eq!(step, SyncStep::Cancelled);
         assert_eq!(mock.take_ops(), vec!["set_polling:500"]);
-        assert_eq!(gs.stage_before_game, Some(2), "saved desktop DPI stage must survive cancelled exit");
 
         *mock.on_after_set_polling.borrow_mut() = None;
         let step = sync_game_target(&mock, &cfg, &Some(ow_key), &mut gs, &mut hw, |_| false, || false, |_| {}).unwrap();
         assert_eq!(step, SyncStep::Committed);
         assert_eq!(mock.take_ops(), vec!["set_polling:1000"]);
-        assert_eq!(gs.stage_before_game, Some(2));
     }
 
     #[test]
@@ -2147,9 +2268,9 @@ mod tests {
         let (cfg, ow_key) = overwatch_config();
         let mock = MockMouse::new_dav4();
         let mut hw = HwCache::default();
-        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
         let mut slept_ms = 0u64;
         let step = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |vks| vks.contains(&0x5b), || false, |ms| slept_ms += ms).unwrap();
@@ -2172,7 +2293,7 @@ mod tests {
         .unwrap();
         assert_eq!(step, SyncStep::Committed);
         assert_eq!(elapsed.get(), 3 * FENCE_STEP_MS + FENCE_QUIET_HELD_MS);
-        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "set_stages:1", "set_btn:04", "set_btn:05"]);
     }
 
     #[test]
@@ -2180,14 +2301,14 @@ mod tests {
         let (cfg, ow_key) = overwatch_config();
         let mock = MockMouse::new_dav4();
         let mut hw = HwCache::default();
-        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()));
+        hw.seed_from_base(mock.spec(), &cfg, 500, Some(mock.stages.borrow().clone()), Some((3000, 3000)));
         let mut gs = GameSync::default();
-        gs.commit_sync(None);
+        gs.commit_sync(None, None);
 
         *mock.fail_set_button.borrow_mut() = Some(0x05);
         let res = sync_game_target(&mock, &cfg, &Some(ow_key.clone()), &mut gs, &mut hw, |_| false, || false, |_| {});
         assert!(res.is_err());
-        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "get_stages", "set_stages:1", "set_btn:04", "set_btn:05"]);
+        assert_eq!(mock.take_ops(), vec!["set_polling:1000", "set_stages:1", "set_btn:04", "set_btn:05"]);
         assert!(gs.dirty);
         assert!(!hw.buttons.contains_key(&0x05), "timed-out button must be marked unknown");
         assert!(hw.buttons.contains_key(&0x04), "already-written button stays cached");

@@ -114,7 +114,9 @@ pub fn import(mouse: &Mouse) -> Result<Config> {
     for b in mouse.spec().buttons {
         let name = b.name;
         for hs in [false, true] {
-            let Ok(f) = mouse.button(mouse.profile(), b.code, hs) else { continue };
+            let Ok(f) = mouse.button(mouse.profile(), b.code, hs) else {
+                continue;
+            };
             if f == b.default {
                 continue;
             }
@@ -178,18 +180,16 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
         changes.push(format!("onboard profile -> {}", cfg.profile.active));
     }
 
-    // The stage picked with the mouse's DPI button is kept: the config's `active`
-    // is written along with a changed stage list, and when the user picks a stage
-    // in the window, the tray menu or `freenapse stages`. Otherwise the mouse's
-    // choice stands and only the live DPI is kept in line with it.
+    // Write both the stage table and the configured `active` stage when either differs,
+    // and always keep the live `(x, y)` sensor DPI in sync with the active stage.
     let want_stages = cfg.stage_pairs();
+    let want_active = cfg.dpi.active.clamp(1, want_stages.len() as u8);
     let cur = mouse.dpi_stages()?;
-    if cur.stages != want_stages {
-        mouse.set_dpi_stages(cfg.dpi.active, &want_stages)?;
-        changes.push(format!("dpi stages -> {:?} (active {})", cfg.dpi.stages, cfg.dpi.active));
+    if cur.stages != want_stages || cur.active != want_active {
+        mouse.set_dpi_stages(want_active, &want_stages)?;
+        changes.push(format!("dpi stages -> {:?} (active {})", cfg.dpi.stages, want_active));
     } else {
-        let active = cur.active.clamp(1, want_stages.len() as u8);
-        let want = want_stages[active as usize - 1];
+        let want = want_stages[want_active as usize - 1];
         if mouse.dpi()? != want {
             mouse.set_dpi(want.0, want.1)?;
             changes.push(format!("dpi -> {}", want.0));
@@ -273,7 +273,9 @@ pub fn apply(mouse: &Mouse, cfg: &Config, polling_rate: u16) -> Result<Vec<Strin
             let key = if hs { format!("hypershift.{name}") } else { name.to_string() };
             let spec = cfg.buttons.get(&key);
             let func = spec.and_then(|s| parse_button(s).ok().flatten()).unwrap_or(b.default);
-            let Some(current) = current_button(mouse, code, name, hs, spec.is_some())? else { continue };
+            let Some(current) = current_button(mouse, code, name, hs, spec.is_some())? else {
+                continue;
+            };
             if current != func {
                 mouse.set_button(mouse.profile(), code, hs, func)?;
                 changes.push(format!("button {key} -> {}", spec.map(String::as_str).unwrap_or("default")));
@@ -291,7 +293,9 @@ pub fn apply_lighting(mouse: &Mouse, cfg: &Config) -> Result<Vec<String>> {
     let mut changes = Vec::new();
     for (zone, _) in mouse.spec().lighting {
         if let Some(spec) = cfg.lighting.zone(zone) {
-            let Ok(e) = crate::lighting::Effect::parse(spec) else { continue };
+            let Ok(e) = crate::lighting::Effect::parse(spec) else {
+                continue;
+            };
             if mouse.lighting(zone)? != Some(e) {
                 mouse.set_lighting(zone, e)?;
                 changes.push(format!("lighting {zone} -> {spec}"));
@@ -321,7 +325,9 @@ pub fn apply_game_buttons(mouse: &Mouse, cfg: &Config, game: Option<&crate::conf
     let mut written = false;
     for b in mouse.spec().buttons {
         let (func, bound) = normal_button_target(cfg, game, b);
-        let Some(current) = current_button(mouse, b.code, b.name, false, bound)? else { continue };
+        let Some(current) = current_button(mouse, b.code, b.name, false, bound)? else {
+            continue;
+        };
         if current != func {
             mouse.set_button(mouse.profile(), b.code, false, func)?;
             written = true;

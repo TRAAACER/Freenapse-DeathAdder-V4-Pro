@@ -620,7 +620,9 @@ fn badge_color(badge: &str) -> u32 {
 /// Debug trace of the input handling, written to the file named by `FREENAPSE_TRACE` when set.
 fn trace(msg: &str) {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    let Some(p) = PATH.get_or_init(|| std::env::var_os("FREENAPSE_TRACE").map(std::path::PathBuf::from)) else { return };
+    let Some(p) = PATH.get_or_init(|| std::env::var_os("FREENAPSE_TRACE").map(std::path::PathBuf::from)) else {
+        return;
+    };
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
         let _ = writeln!(f, "{msg}");
@@ -878,7 +880,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             match wparam {
                 TIMER_TICK => ui.tick(),
                 TIMER_BATTERY => {
-                    if user_active() {
+                    if user_active() && !crate::tray::is_game_mode_unsettled() && IsIconic(hwnd) == 0 {
                         ui.read_live(false);
                         ui.layout();
                         InvalidateRect(hwnd, ptr::null(), 0);
@@ -1090,6 +1092,9 @@ impl Ui {
     /// from the config's is a pending apply, which selects the config's stage.
     fn take_stage(&mut self, st: DpiStages) {
         self.stage_read = Some(Instant::now());
+        if crate::tray::is_game_mode_unsettled() || unsafe { GetForegroundWindow() } != self.hwnd {
+            return;
+        }
         if st.stages != self.cfg.stage_pairs() || st.active == self.cfg.dpi.active {
             return;
         }
@@ -1113,7 +1118,9 @@ impl Ui {
     /// Firmware, serial, profiles and the dongle's pairings.
     fn read_details(&mut self, ident: bool, pair: bool) {
         self.io(move |dev| {
-            let Ok(m) = dev.mouse() else { return Box::new(|ui: &mut Ui| ui.reading = false) };
+            let Ok(m) = dev.mouse() else {
+                return Box::new(|ui: &mut Ui| ui.reading = false);
+            };
             let ident = ident.then(|| {
                 let gen2 = (m.is_wireless() && m.spec().dongle == DongleKind::Gen2Dome).then(|| (m.dongle_leds().ok(), m.dongle_led_brightness().ok()));
                 (m.firmware().ok(), m.dongle_firmware().ok(), gen2, m.serial().ok(), m.profiles().ok())
@@ -1196,8 +1203,9 @@ impl Ui {
         // The DPI button changes the stage on the mouse without telling anyone: while the
         // Performance page is up and the mouse is in use (so awake, its radio already busy),
         // one read every 2 s keeps the page honest. Nothing is asked of a sleeping mouse.
+        let fg_here = GetForegroundWindow() == self.hwnd && !crate::tray::is_game_mode_unsettled();
         let stale = self.stage_read.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
-        if self.page == Page::Performance && stale && !self.pending && self.io_busy == 0 && self.connected && user_active() {
+        if self.page == Page::Performance && fg_here && stale && !self.pending && self.io_busy == 0 && self.connected && user_active() {
             self.read_stage();
         }
         // The mouse went away (cable pulled while the dongle stays, or the other way round):
@@ -1372,7 +1380,9 @@ impl Ui {
         let focus = GetFocus();
         let edit_h = self.s(22);
         for wgt in &self.widgets {
-            let Kind::Edit { text, numeric } = &wgt.kind else { continue };
+            let Kind::Edit { text, numeric } = &wgt.kind else {
+                continue;
+            };
             let idx = match self.edits.iter().position(|e| e.id == wgt.id) {
                 Some(i) => i,
                 None => {
@@ -1989,7 +1999,9 @@ impl Ui {
 
     /// Control point under a client point of a curve widget, if any.
     fn curve_point_at(&self, wgt: &Widget, x: i32, y: i32) -> Option<usize> {
-        let Kind::Curve { points, .. } = &wgt.kind else { return None };
+        let Kind::Curve { points, .. } = &wgt.kind else {
+            return None;
+        };
         let plot = self.curve_plot(&wgt.rect);
         let r2 = self.s(10) * self.s(10);
         points
@@ -2138,7 +2150,9 @@ impl Ui {
     }
 
     fn slider_value_at(&self, wgt: &Widget, x: i32) -> i32 {
-        let Kind::Slider { min, max, step, .. } = &wgt.kind else { return 0 };
+        let Kind::Slider { min, max, step, .. } = &wgt.kind else {
+            return 0;
+        };
         let (tl, tr) = self.track_span(wgt, &wgt.rect);
         let frac = ((x - tl) as f32 / (tr - tl).max(1) as f32).clamp(0.0, 1.0);
         let raw = *min as f32 + frac * (*max - *min) as f32;
@@ -2334,7 +2348,9 @@ impl Ui {
     }
 
     unsafe fn edit_committed(&mut self, h: HWND) {
-        let Some(e) = self.edits.iter().find(|e| e.hwnd == h) else { return };
+        let Some(e) = self.edits.iter().find(|e| e.hwnd == h) else {
+            return;
+        };
         let id = e.id;
         let mut buf = [0u16; 256];
         let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
@@ -2416,7 +2432,9 @@ impl Ui {
 
     /// Live update while typing (the game list's search box).
     unsafe fn edit_changed(&mut self, h: HWND) {
-        let Some(e) = self.edits.iter().find(|e| e.hwnd == h) else { return };
+        let Some(e) = self.edits.iter().find(|e| e.hwnd == h) else {
+            return;
+        };
         if e.id != Id::GameFilter {
             return;
         }
@@ -2793,7 +2811,9 @@ impl Ui {
             }
             Id::Turbo => {
                 let key = self.button_key();
-                let Some(cur) = self.layer_buttons().get(&key).cloned() else { return };
+                let Some(cur) = self.layer_buttons().get(&key).cloned() else {
+                    return;
+                };
                 let (base, _) = pages::turbo_split(&cur);
                 let spec = pages::with_turbo(&base, if v == 1 { Some(10) } else { None });
                 self.layer_buttons_mut().insert(key, spec);
@@ -2801,7 +2821,9 @@ impl Ui {
             }
             Id::TurboRate => {
                 let key = self.button_key();
-                let Some(cur) = self.layer_buttons().get(&key).cloned() else { return };
+                let Some(cur) = self.layer_buttons().get(&key).cloned() else {
+                    return;
+                };
                 let (base, _) = pages::turbo_split(&cur);
                 self.layer_buttons_mut().insert(key, pages::with_turbo(&base, Some(v as u8)));
                 self.button_write()
@@ -2941,7 +2963,9 @@ impl Ui {
                 Write::None
             }
             Id::LightEffect(i) | Id::LightColor(i) => {
-                let Some((zone, _)) = self.spec.lighting.get(i) else { return };
+                let Some((zone, _)) = self.spec.lighting.get(i) else {
+                    return;
+                };
                 let cur = self.cfg.lighting.zone(zone).and_then(|s| crate::lighting::Effect::parse(s).ok());
                 let color = cur.and_then(|e| e.color()).unwrap_or(pages::LIGHT_COLORS[3].1);
                 use crate::lighting::Effect;
